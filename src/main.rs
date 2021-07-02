@@ -55,8 +55,9 @@ pub trait Transport: Protocol {
     fn listen(&self, address: Self::Address) -> Box<dyn Stream<Item = Self::Connection>>;
 }
 
+// Currently failure is not built into the system, so like what happens if it fails to send etc
 #[async_trait]
-impl<P: Protocol + SupportedConfiguration<Self>> Protocol for UDP<P> {
+impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>> Protocol for UDP<P> {
     type Address = (P::Address, u16);
     type Connection = UDPConnection<P>;
     type Data = Vec<u8>;
@@ -85,15 +86,32 @@ impl<P: Protocol + SupportedConfiguration<Self>> Protocol for UDP<P> {
     // data. The thing is that the packet then should be part of the UDP Connection? Also, this
     // should probably call the receive in the lower layers first...
     async fn receive(connection: &mut Self::Connection) -> Self::Data {
-        unimplemented!()
+        let data = P::receive(&mut connection.connection).await;
+        let packet = pnet_packet::udp::UdpPacket::new(&data).unwrap();
+        packet.payload().to_vec()
     }
 
     async fn send(connection: &Self::Connection, data: &Self::Data) {
-        todo!()
+        let packet_buffer = vec![0; 8 + data.len()];
+        let packet_total_len = packet_buffer.len();
+        let mut packet = pnet_packet::udp::MutableUdpPacket::owned(packet_buffer).unwrap();
+        packet.set_source(connection.source_port);
+        packet.set_destination(connection.destination_port);
+        packet.set_length(packet_total_len as u16);
+        let (source_address, _): Self::Address;
+        let (destination_address, _): Self::Address;
+        // I believe the issue here is that the checksum function requires a IPv4 address, and
+        // the way the protocol is written, we cannot guarantee that...so either I can fake the
+        // checksum or....
+        let checksum =
+            pnet_packet::udp::ipv4_checksum(&packet, &source_address, &destination_address);
+        packet.set_checksum(checksum);
+        let packet_vec = packet.packet().to_vec();
+        P::send(&connection.connection, &packet_vec);
     }
 }
 
-impl<P: Protocol + SupportedConfiguration<Self>> Transport for UDP<P> {
+impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>> Transport for UDP<P> {
     fn listen(&self, address: Self::Address) -> Box<dyn Stream<Item = Self::Connection>> {
         todo!()
     }
@@ -221,7 +239,8 @@ impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>, F: Fn(Ipv4Addr)
                                 // underlying vector, make another packet?
         packet.set_source(connection.source_ip);
         packet.set_destination(connection.destination_ip);
-        P::send(&connection.connection, &packet.packet().to_vec());
+        let packet_vec = packet.packet().to_vec();
+        P::send(&connection.connection, &packet_vec);
     }
 }
 

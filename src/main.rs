@@ -206,16 +206,22 @@ impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>, F: Fn(Ipv4Addr)
     async fn send(connection: &Self::Connection, data: &Self::Data) {
         // double check the packet setup. DOUBLE CHECK!!!!!!!!!!!!!!!!!!!!!!!!!!!
         let packet_buffer = vec![0; 20 + data.len()];
+        let packet_total_len = packet_buffer.len();
         let mut packet = pnet_packet::ipv4::MutableIpv4Packet::owned(packet_buffer).unwrap();
         packet.set_version(4);
         packet.set_header_length(5);
         packet.set_dscp(0); // This field is largely unimportant
         packet.set_ecn(0);
-        packet.set_total_length(packet_buffer.len().try_into().unwrap());
-
+        packet.set_total_length(packet_total_len as u16);
+        packet.set_flags(0);
+        packet.set_fragment_offset(0); // <--- This is not correct, reconsider
+        packet.set_ttl(10);
+        packet.set_next_level_protocol(pnet_packet::ip::IpNextHeaderProtocol::new(17));
+        packet.set_checksum(0); // <--- Reconsider this also, maybe make full packet,then get
+                                // underlying vector, make another packet?
         packet.set_source(connection.source_ip);
-
-        P::send(&connection.connection, data);
+        packet.set_destination(connection.destination_ip);
+        P::send(&connection.connection, &packet.packet().to_vec());
     }
 }
 

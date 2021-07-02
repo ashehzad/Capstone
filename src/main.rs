@@ -29,13 +29,12 @@ pub trait Protocol {
     type Connection: Send + Sync;
     type Data;
     type ConnectionConfig;
-    fn connect<T>(
+    fn connect(
         &self,
         source_address: Self::Address,
         destination_address: Self::Address,
-    ) -> Self::Connection
-    where
-        Self: SupportedConfiguration<T>;
+        connection_config: Self::ConnectionConfig,
+    ) -> Self::Connection;
     async fn receive(connection: &mut Self::Connection) -> Self::Data;
     async fn send(connection: &Self::Connection, data: &Self::Data);
 }
@@ -63,18 +62,18 @@ impl<P: Protocol + SupportedConfiguration<Self>> Protocol for UDP<P> {
 
     // In connect I can de-struct the address, because i specified right above that
     // the address for UDP is a tuple
-    fn connect<T>(
+    fn connect(
         &self,
         (source_address, source_port): Self::Address,
         (destination_address, destination_port): Self::Address,
-    ) -> Self::Connection
-    where
-        Self: SupportedConfiguration<T>,
-    {
+        connection_config: Self::ConnectionConfig,
+    ) -> Self::Connection {
         UDPConnection {
-            connection: self
-                .inner_protocol
-                .connect::<Self>(source_address, destination_address),
+            connection: self.inner_protocol.connect(
+                source_address,
+                destination_address,
+                P::get_config(),
+            ),
             source_port,
             destination_port,
         }
@@ -104,7 +103,7 @@ pub struct UDPConnection<P: Protocol> {
     destination_port: u16,
 }
 
-struct EtherConnectionConfig {
+pub struct EtherConnectionConfig {
     ether_type: pnet_packet::ethernet::EtherType,
 }
 
@@ -120,15 +119,6 @@ impl<P, F> SupportedConfiguration<IP<P, F>> for Ether {
     }
 }
 
-impl<
-        P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>,
-        F: Fn(Ipv4Addr) -> P::Address,
-        T,
-    > SupportedConfiguration<T> for IP<P, F>
-{
-    fn get_config() -> Self::ConnectionConfig {}
-}
-
 #[async_trait]
 impl Protocol for Ether {
     type Address = MacAddr;
@@ -136,18 +126,16 @@ impl Protocol for Ether {
     type Data = Vec<u8>;
     type ConnectionConfig = EtherConnectionConfig;
 
-    fn connect<T>(
+    fn connect(
         &self,
         source_address: Self::Address,
         destination_address: Self::Address,
-    ) -> Self::Connection
-    where
-        Self: SupportedConfiguration<T>,
-    {
+        connection_config: Self::ConnectionConfig,
+    ) -> Self::Connection {
         EtherConnection {
             source_mac: source_address,
             destination_mac: destination_address,
-            config: Self::get_config(),
+            config: connection_config,
             sender: self.sender.clone(),
             receiver: self.sender.subscribe(),
         }
@@ -190,18 +178,17 @@ impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>, F: Fn(Ipv4Addr)
 
     // The source and destination address for the inner protocol will be the MAC address, and so
     // there type is not what is the type listed here.
-    fn connect<T>(
+    fn connect(
         &self,
         source_address: Self::Address,
         destination_address: Self::Address,
-    ) -> Self::Connection
-    where
-        Self: SupportedConfiguration<T>,
-    {
+        connection_config: Self::ConnectionConfig,
+    ) -> Self::Connection {
         IPConnection {
-            connection: self.inner_protocol.connect::<Self>(
+            connection: self.inner_protocol.connect(
                 (self.address_translator)(source_address),
                 (self.address_translator)(destination_address),
+                P::get_config(),
             ),
             source_ip: source_address,
             destination_ip: destination_address,

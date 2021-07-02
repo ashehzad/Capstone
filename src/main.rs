@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use pnet_base::MacAddr;
 use pnet_packet::Packet;
+use std::convert::TryInto;
 use std::net::Ipv4Addr;
 use tokio::sync::broadcast;
 use tokio_stream::Stream;
@@ -203,7 +204,17 @@ impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>, F: Fn(Ipv4Addr)
     }
 
     async fn send(connection: &Self::Connection, data: &Self::Data) {
-        let packet = pnet_packet::ipv4::Ipv4Packet::new(&data);
+        // double check the packet setup. DOUBLE CHECK!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        let packet_buffer = vec![0; 20 + data.len()];
+        let mut packet = pnet_packet::ipv4::MutableIpv4Packet::owned(packet_buffer).unwrap();
+        packet.set_version(4);
+        packet.set_header_length(5);
+        packet.set_dscp(0); // This field is largely unimportant
+        packet.set_ecn(0);
+        packet.set_total_length(packet_buffer.len().try_into().unwrap());
+
+        packet.set_source(connection.source_ip);
+
         P::send(&connection.connection, data);
     }
 }

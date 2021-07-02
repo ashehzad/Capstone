@@ -48,7 +48,8 @@ pub trait Bind: Protocol {
 // The idea is to bind to a address, and then give back connections, a continuous loop.
 // I guess the thing to think about is will the connection be maintained? or
 // every time we receive a new packet, we get back a "new connection". Probably for UDP it will
-// have to be a new connection because no state is maintained, but TCP will be different.
+// have to be a new connection because no state is maintained, but TCP will be different. THIS is
+// for only new connections, normally the server will just use send/receive
 pub trait Transport: Protocol {
     fn listen(&self, address: Self::Address) -> Box<dyn Stream<Item = Self::Connection>>;
 }
@@ -202,7 +203,8 @@ impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>, F: Fn(Ipv4Addr)
     }
 
     async fn send(connection: &Self::Connection, data: &Self::Data) {
-        todo!()
+        let packet = pnet_packet::ipv4::Ipv4Packet::new(&data);
+        P::send(&connection.connection, data);
     }
 }
 

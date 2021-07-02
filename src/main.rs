@@ -1,61 +1,55 @@
-use std::collections::VecDeque;
-extern crate byteorder;
-extern crate packet;
-extern crate pnet;
-extern crate tokio;
-use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
-use pnet::util::MacAddr;
-use std::marker::PhantomData;
-use std::net::{IpAddr, Ipv4Addr};
+use async_trait::async_trait;
+use pnet_base::MacAddr;
+use pnet_packet::Packet;
+use std::net::Ipv4Addr;
+use tokio::sync::broadcast;
 
-fn main() {
-    let udp_packet = UDPHeader {
-        source_port: 0,
-        destination_port: 0,
-        length: 0,
-        checksum: 0,
-    }
-    .make_udp_packet(vec![1, 2]);
-    println!("{}", udp_packet.len());
-    let mut result = Vec::new();
-    for i in (0..udp_packet.len()).step_by(2) {
-        result.push(BigEndian::read_u16(&udp_packet[i..])); // <-- this hear converts everything
-                                                            // back to u16, but the data section is already u8 to start with so probably should only
-                                                            // go the length of the udp header.
-    }
-    let udp = packet::udp::Builder::default().destination(16);
-    let udpp = pnet::packet::udp::Udp {
-        source: 1345,
-        destination: 0,
-        length: 0,
-        checksum: 0,
-        payload: vec![],
-    };
-    println!("{:?}", result);
+#[tokio::main]
+async fn main() {
+    // let udp = packet::udp::Builder::default().destination(16);
+    // let udpp = pnet::packet::udp::Udp {
+    //     source: 1345,
+    //     destination: 0,
+    //     length: 0,
+    //     checksum: 0,
+    //     payload: vec![],
+    // };
+
+    // let (tx, mut rx1) = broadcast::channel(16);
+
+    // let computer_1 = Ether {
+    //     sender: (),
+    //     receiver: (),
+    // };
 }
-
+#[async_trait]
 pub trait Protocol {
     type Address;
-    type Connection;
+    type Connection: Send + Sync;
     type Data;
     fn connect(
         &self,
         source_address: Self::Address,
         destination_address: Self::Address,
     ) -> Self::Connection;
-
-    fn receive(connection: &Self::Connection) -> Self::Data;
-    fn send(connection: &Self::Connection, data: &Self::Data);
+    async fn receive(connection: &mut Self::Connection) -> Self::Data;
+    async fn send(connection: &Self::Connection, data: &Self::Data);
 }
+// The idea is to bind to a address, and then give back connections, a continuous loop.
+// I guess the thing to think about is will the connection be maintained? or
+// every time we receive a new packet, we get back a "new connection". Probably for UDP it will
+// have to be a new connection because no state is maintained, but TCP will be different.
 pub trait Transport: Protocol {
     fn listen(&self, address: Self::Address) -> Box<dyn Iterator<Item = Self::Connection>>;
 }
 
+#[async_trait]
 impl<P: Protocol> Protocol for UDP<P> {
     type Address = (P::Address, u16);
     type Connection = UDPConnection<P>;
     type Data = Vec<u8>;
-
+    // In connect I can de-struct the address, because i specified right above that
+    // the address for UDP is a tuple
     fn connect(
         &self,
         (source_address, source_port): Self::Address,
@@ -70,11 +64,14 @@ impl<P: Protocol> Protocol for UDP<P> {
         }
     }
 
-    fn receive(connection: &Self::Connection) -> Self::Data {
-        todo!()
+    // So at this layer I should receive a IP packet, and I need to extract from it, just the
+    // data. The thing is that the packet then should be part of the UDP Connection? Also, this
+    // should probably call the receive in the lower layers first...
+    async fn receive(connection: &mut Self::Connection) -> Self::Data {
+        unimplemented!()
     }
 
-    fn send(connection: &Self::Connection, data: &Self::Data) {
+    async fn send(connection: &Self::Connection, data: &Self::Data) {
         todo!()
     }
 }
@@ -90,9 +87,77 @@ pub struct UDPConnection<P: Protocol> {
     source_port: u16,
     destination_port: u16,
 }
+#[async_trait]
+impl Protocol for Ether {
+    type Address = MacAddr;
+    type Connection = EtherConnection;
+    type Data = Vec<u8>;
 
-pub struct IPConnection {
-    connection: EtherConnection,
+    fn connect(
+        &self,
+        source_address: Self::Address,
+        destination_address: Self::Address,
+    ) -> Self::Connection {
+        EtherConnection {
+            source_mac: source_address,
+            destination_mac: destination_address,
+            sender: self.sender.clone(),
+            receiver: self.sender.subscribe(),
+        }
+    }
+
+    async fn receive(connection: &mut Self::Connection) -> Self::Data {
+        loop {
+            let data = connection.receiver.recv().await.unwrap();
+            let packet = pnet_packet::ethernet::EthernetPacket::new(&data).unwrap();
+            let packet_source = packet.get_source();
+            let packet_destination = packet.get_destination();
+            if packet_source == connection.destination_mac
+                && packet_destination == connection.source_mac
+            {
+                return packet.payload().to_vec();
+            }
+        }
+    }
+
+    async fn send(connection: &Self::Connection, data: &Self::Data) {}
+}
+#[async_trait]
+impl<P: Protocol<Data = Vec<u8>>, F: Fn(Ipv4Addr) -> P::Address> Protocol for IP<P, F> {
+    type Address = Ipv4Addr;
+    type Connection = IPConnection<P>;
+    type Data = Vec<u8>;
+
+    // The source and destination address for the inner protocol will be the MAC address, and so
+    // there type is not what is the type listed here.
+    fn connect(
+        &self,
+        source_address: Self::Address,
+        destination_address: Self::Address,
+    ) -> Self::Connection {
+        IPConnection {
+            connection: self.inner_protocol.connect(
+                (self.address_translator)(source_address),
+                (self.address_translator)(destination_address),
+            ),
+            source_ip: source_address,
+            destination_ip: destination_address,
+        }
+    }
+
+    async fn receive(connection: &mut Self::Connection) -> Self::Data {
+        let data = P::receive(&mut connection.connection).await;
+        let packet = pnet_packet::ipv4::Ipv4Packet::new(&data).unwrap();
+        packet.payload().to_vec()
+    }
+
+    async fn send(connection: &Self::Connection, data: &Self::Data) {
+        todo!()
+    }
+}
+
+pub struct IPConnection<P: Protocol> {
+    connection: P::Connection,
     source_ip: Ipv4Addr,
     destination_ip: Ipv4Addr,
 }
@@ -104,10 +169,6 @@ pub struct EtherConnection {
     receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
 }
 
-pub trait Network: Protocol {}
-
-pub trait Link: Protocol {}
-
 pub struct Ether {
     sender: tokio::sync::broadcast::Sender<Vec<u8>>,
     receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
@@ -117,75 +178,11 @@ pub struct UDP<P> {
     inner_protocol: P,
 }
 
-// Should the size limit of UDP be set into the protocol?
-pub struct UDPHeader {
-    source_port: u16,
-    destination_port: u16,
-    length: u16,
-    checksum: u16,
+pub struct IP<P: Protocol, F: Fn(Ipv4Addr) -> P::Address> {
+    inner_protocol: P,
+    address_translator: F,
 }
 
-impl UDPHeader {
-    pub fn make_udp_packet(&mut self, data: Vec<u8>) -> Vec<u8> {
-        //let mut udp_packet = VecDeque::new();
-        let mut udp_packet = Vec::new();
-        self.length = (8 + data.len()) as u16;
+pub trait Network: Protocol {}
 
-        //let destination_port_bytes = udp_packet.extend(self.destination_port.to_be_bytes());
-
-        // WHAT IS THE MEANING OF GLOBAL?
-
-        // udp.write_u16::<BigEndian>(source_port).unwrap();
-        // println!("{:?}", udp);
-
-        udp_packet.write_u16::<BigEndian>(self.source_port).unwrap();
-        udp_packet
-            .write_u16::<BigEndian>(self.destination_port)
-            .unwrap();
-        udp_packet.write_u16::<BigEndian>(self.length).unwrap();
-        for i in data {
-            udp_packet.write_u8(i).unwrap(); // <-- Extend vs push, why does one work and
-                                             // another
-                                             // not?
-        }
-        udp_packet
-    }
-}
-
-// Some things here are not exact lengths, so I gave it the smallest largest size possible, so
-// that we can fit the data in at least, i.e. flags needs 3 bytes, given 8. Issue with this is
-// enforcement, things that can be a maximum of 1 bit are not 8 bits etc
-pub struct IPHeader {
-    version: u8,
-    IHL: u8,
-    DSCP: u8,
-    ECN: u8,
-    total_length: u16,
-    id: u16,
-    flags: u8,
-    fragment_offset: u16,
-    ttl: u8,
-    protocol: u8,
-    header_checksum: u16,
-    source_ip_address: u32,
-    destination_ip_address: u32,
-}
-impl IPHeader {
-    pub fn make_ip_packet(&mut self, data: Vec<u8>) -> Vec<u8> {
-        unimplemented!()
-    }
-}
-pub struct EtherHeader {
-    preamble: u64,
-    sfd: u8,
-    destination_address: u64,
-    source_address: u64,
-    length: u16,
-    crc: u32,
-}
-
-impl EtherHeader {
-    pub fn make_ether_packet() -> Vec<u8> {
-        unimplemented!()
-    }
-}
+pub trait Link: Protocol {}

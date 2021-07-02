@@ -9,5 +9,8 @@ edition = "2018"
 [dependencies]
 byteorder = "1.4.3"
 packet = "0.1.4"
-pnet = "0.28.0"
-tokio = {version = "1.7",features = ["sync"]}
+pnet_packet = "0.28.0"
+pnet_base = "0.28.0"
+tokio = {version = "1.7",features = ["sync","rt","macros","rt-multi-thread"]}
+async-trait = "0.1.50"
+tokio-stream = "0.1.6"

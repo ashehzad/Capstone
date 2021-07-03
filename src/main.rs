@@ -17,16 +17,16 @@ async fn main() {
     //     payload: vec![],
     // };
 
-    // let (tx, mut rx1) = broadcast::channel(16);
+    let (tx, mut rx1) = broadcast::channel(16);
 
-    // let computer_1 = Ether {
-    //     sender: (),
-    //     receiver: (),
-    // };
+    let computer_1 = Ether {
+        sender: tx,
+        receiver: rx1,
+    };
 }
 #[async_trait]
 pub trait Protocol {
-    type Address;
+    type Address: Copy + Send + Sync;
     type Connection: Send + Sync;
     type Data;
     type ConnectionConfig;
@@ -57,7 +57,10 @@ pub trait Transport: Protocol {
 
 // Currently failure is not built into the system, so like what happens if it fails to send etc
 #[async_trait]
-impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>> Protocol for UDP<P> {
+impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>> Protocol for UDP<P>
+where
+    Self: UDPChecksum<P>,
+{
     type Address = (P::Address, u16);
     type Connection = UDPConnection<P>;
     type Data = Vec<u8>;
@@ -79,6 +82,8 @@ impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>> Protocol for UD
             ),
             source_port,
             destination_port,
+            destination_address,
+            source_address,
         }
     }
 
@@ -86,9 +91,15 @@ impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>> Protocol for UD
     // data. The thing is that the packet then should be part of the UDP Connection? Also, this
     // should probably call the receive in the lower layers first...
     async fn receive(connection: &mut Self::Connection) -> Self::Data {
-        let data = P::receive(&mut connection.connection).await;
-        let packet = pnet_packet::udp::UdpPacket::new(&data).unwrap();
-        packet.payload().to_vec()
+        loop {
+            let data = P::receive(&mut connection.connection).await;
+            let packet = pnet_packet::udp::UdpPacket::new(&data).unwrap();
+            if packet.get_source() == connection.destination_port
+                && packet.get_destination() == connection.source_port
+            {
+                return packet.payload().to_vec();
+            }
+        }
     }
 
     async fn send(connection: &Self::Connection, data: &Self::Data) {
@@ -98,20 +109,48 @@ impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>> Protocol for UD
         packet.set_source(connection.source_port);
         packet.set_destination(connection.destination_port);
         packet.set_length(packet_total_len as u16);
-        let (source_address, _): Self::Address;
-        let (destination_address, _): Self::Address;
+
         // I believe the issue here is that the checksum function requires a IPv4 address, and
         // the way the protocol is written, we cannot guarantee that...so either I can fake the
         // checksum or....
-        let checksum =
-            pnet_packet::udp::ipv4_checksum(&packet, &source_address, &destination_address);
+        let checksum = Self::calculate_checksum(
+            packet.to_immutable(),
+            connection.source_address,
+            connection.destination_address,
+        );
         packet.set_checksum(checksum);
         let packet_vec = packet.packet().to_vec();
-        P::send(&connection.connection, &packet_vec);
+        P::send(&connection.connection, &packet_vec).await;
     }
 }
 
-impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>> Transport for UDP<P> {
+pub trait UDPChecksum<P: Protocol> {
+    fn calculate_checksum(
+        packet: pnet_packet::udp::UdpPacket,
+        source_address: P::Address,
+        destination_address: P::Address,
+    ) -> u16;
+}
+
+impl<
+        P: Protocol<Data = Vec<u8>> + SupportedConfiguration<IP<P, F>>,
+        F: Fn(Ipv4Addr) -> P::Address,
+        T,
+    > UDPChecksum<IP<P, F>> for UDP<T>
+{
+    fn calculate_checksum(
+        packet: pnet_packet::udp::UdpPacket,
+        source_address: <IP<P, F> as Protocol>::Address,
+        destination_address: <IP<P, F> as Protocol>::Address,
+    ) -> u16 {
+        pnet_packet::udp::ipv4_checksum(&packet, &source_address, &destination_address)
+    }
+}
+
+impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>> Transport for UDP<P>
+where
+    Self: UDPChecksum<P>,
+{
     fn listen(&self, address: Self::Address) -> Box<dyn Stream<Item = Self::Connection>> {
         todo!()
     }
@@ -121,10 +160,16 @@ pub struct UDPConnection<P: Protocol> {
     connection: P::Connection,
     source_port: u16,
     destination_port: u16,
+    destination_address: P::Address,
+    source_address: P::Address,
 }
 
 pub struct EtherConnectionConfig {
     ether_type: pnet_packet::ethernet::EtherType,
+}
+
+pub struct IPConnectionConfig {
+    protocol: pnet_packet::ip::IpNextHeaderProtocol,
 }
 
 pub trait SupportedConfiguration<P>: Protocol {
@@ -139,6 +184,18 @@ impl<P, F> SupportedConfiguration<IP<P, F>> for Ether {
     }
 }
 
+impl<
+        P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>,
+        F: Fn(Ipv4Addr) -> P::Address,
+        T,
+    > SupportedConfiguration<UDP<T>> for IP<P, F>
+{
+    fn get_config() -> Self::ConnectionConfig {
+        IPConnectionConfig {
+            protocol: pnet_packet::ip::IpNextHeaderProtocols::Udp,
+        }
+    }
+}
 #[async_trait]
 impl Protocol for Ether {
     type Address = MacAddr;
@@ -194,7 +251,7 @@ impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>, F: Fn(Ipv4Addr)
     type Address = Ipv4Addr;
     type Connection = IPConnection<P>;
     type Data = Vec<u8>;
-    type ConnectionConfig = ();
+    type ConnectionConfig = IPConnectionConfig;
 
     // The source and destination address for the inner protocol will be the MAC address, and so
     // there type is not what is the type listed here.
@@ -212,35 +269,37 @@ impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>, F: Fn(Ipv4Addr)
             ),
             source_ip: source_address,
             destination_ip: destination_address,
+            config: connection_config,
         }
     }
 
     async fn receive(connection: &mut Self::Connection) -> Self::Data {
-        let data = P::receive(&mut connection.connection).await;
-        let packet = pnet_packet::ipv4::Ipv4Packet::new(&data).unwrap();
-        packet.payload().to_vec()
+        loop {
+            let data = P::receive(&mut connection.connection).await;
+            let packet = pnet_packet::ipv4::Ipv4Packet::new(&data).unwrap();
+            if packet.get_source() == connection.destination_ip
+                && packet.get_destination() == connection.source_ip
+                && connection.config.protocol == packet.get_next_level_protocol()
+            {
+                return packet.payload().to_vec();
+            }
+        }
     }
 
     async fn send(connection: &Self::Connection, data: &Self::Data) {
-        // double check the packet setup. DOUBLE CHECK!!!!!!!!!!!!!!!!!!!!!!!!!!!
         let packet_buffer = vec![0; 20 + data.len()];
         let packet_total_len = packet_buffer.len();
         let mut packet = pnet_packet::ipv4::MutableIpv4Packet::owned(packet_buffer).unwrap();
         packet.set_version(4);
         packet.set_header_length(5);
-        packet.set_dscp(0); // This field is largely unimportant
-        packet.set_ecn(0);
         packet.set_total_length(packet_total_len as u16);
-        packet.set_flags(0);
-        packet.set_fragment_offset(0); // <--- This is not correct, reconsider
-        packet.set_ttl(10);
-        packet.set_next_level_protocol(pnet_packet::ip::IpNextHeaderProtocol::new(17));
-        packet.set_checksum(0); // <--- Reconsider this also, maybe make full packet,then get
-                                // underlying vector, make another packet?
+        packet.set_next_level_protocol(connection.config.protocol);
         packet.set_source(connection.source_ip);
         packet.set_destination(connection.destination_ip);
+        let checksum = pnet_packet::ipv4::checksum(&packet.to_immutable());
+        packet.set_checksum(checksum);
         let packet_vec = packet.packet().to_vec();
-        P::send(&connection.connection, &packet_vec);
+        P::send(&connection.connection, &packet_vec).await;
     }
 }
 
@@ -248,6 +307,7 @@ pub struct IPConnection<P: Protocol> {
     connection: P::Connection,
     source_ip: Ipv4Addr,
     destination_ip: Ipv4Addr,
+    config: IPConnectionConfig,
 }
 
 pub struct EtherConnection {
@@ -269,7 +329,9 @@ pub struct UDP<P> {
 
 pub struct IP<P, F> {
     inner_protocol: P,
-    address_translator: F,
+    address_translator: F, // THIS NEEDS TO BE IMPLEMENTED
+                           //maybe have a ARP table like thing, where when you start uo you register ourself, with mac +
+                           // Ip and when you finish you delete entry, and then this function can look it up
 }
 
 pub trait Network: Protocol {}

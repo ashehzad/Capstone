@@ -1,35 +1,39 @@
 use async_trait::async_trait;
 use pnet_base::MacAddr;
 use pnet_packet::Packet;
-use std::convert::TryInto;
 use std::net::Ipv4Addr;
 use tokio::sync::broadcast;
 use tokio_stream::Stream;
 
 #[tokio::main]
 async fn main() {
-    // let udp = packet::udp::Builder::default().destination(16);
-    // let udpp = pnet::packet::udp::Udp {
-    //     source: 1345,
-    //     destination: 0,
-    //     length: 0,
-    //     checksum: 0,
-    //     payload: vec![],
-    // };
+    let (tx, rx1) = broadcast::channel(16);
 
-    let (tx, mut rx1) = broadcast::channel(16);
-
-    let computer_1 = Ether {
+    // So i can call connect on Ether, but not IP or UDP, probably because they require the
+    // information on the lower protocol
+    let ether_1 = Ether {
         sender: tx,
         receiver: rx1,
     };
+
+    let ip_1 = IP {
+        inner_protocol: ether_1,
+        address_translator: (),
+    };
+
+    let udp_1 = UDP {
+        inner_protocol: ip_1,
+    };
 }
+// Use of this trait allows the functions to be async. The reason why the functions should be
+// async is so that we do not have to deal with multithreading.
 #[async_trait]
 pub trait Protocol {
     type Address: Copy + Send + Sync;
     type Connection: Send + Sync;
     type Data;
     type ConnectionConfig;
+
     fn connect(
         &self,
         source_address: Self::Address,
@@ -66,8 +70,6 @@ where
     type Data = Vec<u8>;
     type ConnectionConfig = ();
 
-    // In connect I can de-struct the address, because i specified right above that
-    // the address for UDP is a tuple
     fn connect(
         &self,
         (source_address, source_port): Self::Address,
@@ -87,9 +89,6 @@ where
         }
     }
 
-    // So at this layer I should receive a IP packet, and I need to extract from it, just the
-    // data. The thing is that the packet then should be part of the UDP Connection? Also, this
-    // should probably call the receive in the lower layers first...
     async fn receive(connection: &mut Self::Connection) -> Self::Data {
         loop {
             let data = P::receive(&mut connection.connection).await;
@@ -109,10 +108,6 @@ where
         packet.set_source(connection.source_port);
         packet.set_destination(connection.destination_port);
         packet.set_length(packet_total_len as u16);
-
-        // I believe the issue here is that the checksum function requires a IPv4 address, and
-        // the way the protocol is written, we cannot guarantee that...so either I can fake the
-        // checksum or....
         let checksum = Self::calculate_checksum(
             packet.to_immutable(),
             connection.source_address,

@@ -9,24 +9,62 @@ use tokio_stream::Stream;
 async fn main() {
     let (tx, rx1) = broadcast::channel(16);
 
-    // So i can call connect on Ether, but not IP or UDP, probably because they require the
-    // information on the lower protocol
     let ether_1 = Ether {
-        sender: tx,
+        sender: tx.clone(),
         receiver: rx1,
     };
 
     let ip_1 = IP {
         inner_protocol: ether_1,
-        address_translator: (),
+        address_translator: |ipv4_address: Ipv4Addr| match ipv4_address.octets() {
+            [192, 16, 16, 16] => MacAddr::new(10, 12, 14, 16, 18, 20),
+            [190, 16, 16, 16] => MacAddr::new(12, 12, 14, 16, 18, 20),
+            _ => panic!("Unknown Address!!!!!!!!!!!!!!!!!"),
+        },
     };
 
     let udp_1 = UDP {
         inner_protocol: ip_1,
     };
+
+    let ether_2 = Ether {
+        receiver: tx.subscribe(),
+        sender: tx,
+    };
+
+    let ip_2 = IP {
+        inner_protocol: ether_2,
+        address_translator: |ipv4_address: Ipv4Addr| match ipv4_address.octets() {
+            [192, 16, 16, 16] => MacAddr::new(10, 12, 14, 16, 18, 20),
+            [190, 16, 16, 16] => MacAddr::new(12, 12, 14, 16, 18, 20),
+            _ => panic!("Unknown Address!!!!!!!!!!!!!!!!!"),
+        },
+    };
+
+    let udp_2 = UDP {
+        inner_protocol: ip_2,
+    };
+
+    let connection_1 = udp_1.connect(
+        (Ipv4Addr::new(192, 16, 16, 16), 80),
+        (Ipv4Addr::new(190, 16, 16, 16), 80),
+        (),
+    );
+    let data = vec![1, 2, 4];
+
+    let mut connection_2 = udp_2.connect(
+        (Ipv4Addr::new(190, 16, 16, 16), 80),
+        (Ipv4Addr::new(192, 16, 16, 16), 80),
+        (),
+    );
+    UDP::send(&connection_1, &data).await;
+    println!("Hello");
+    let recieved = UDP::receive(&mut connection_2).await;
+    println!("Not received");
+    println!("{:?}", recieved);
 }
 // Use of this trait allows the functions to be async. The reason why the functions should be
-// async is so that we do not have to deal with multithreading.
+// async is so that I do not have to deal with multithreading.
 #[async_trait]
 pub trait Protocol {
     type Address: Copy + Send + Sync;
@@ -47,16 +85,7 @@ pub trait Protocol {
 pub trait Bind: Protocol {
     type ServerConnection: Send + Sync;
     fn bind(address: Self::Address) -> Self::ServerConnection;
-    async fn receive(connection: &mut Self::ServerConnection) -> Self::Data;
-}
-
-// The idea is to bind to a address, and then give back connections, a continuous loop.
-// I guess the thing to think about is will the connection be maintained? or
-// every time we receive a new packet, we get back a "new connection". Probably for UDP it will
-// have to be a new connection because no state is maintained, but TCP will be different. THIS is
-// for only new connections, normally the server will just use send/receive
-pub trait Transport: Protocol {
-    fn listen(&self, address: Self::Address) -> Box<dyn Stream<Item = Self::Connection>>;
+    async fn listen(connection: &mut Self::ServerConnection) -> Self::Connection;
 }
 
 // Currently failure is not built into the system, so like what happens if it fails to send etc
@@ -93,6 +122,7 @@ where
         loop {
             let data = P::receive(&mut connection.connection).await;
             let packet = pnet_packet::udp::UdpPacket::new(&data).unwrap();
+            println!("{:?}", packet);
             if packet.get_source() == connection.destination_port
                 && packet.get_destination() == connection.source_port
             {
@@ -108,6 +138,7 @@ where
         packet.set_source(connection.source_port);
         packet.set_destination(connection.destination_port);
         packet.set_length(packet_total_len as u16);
+        packet.set_payload(data);
         let checksum = Self::calculate_checksum(
             packet.to_immutable(),
             connection.source_address,
@@ -179,18 +210,6 @@ impl<P, F> SupportedConfiguration<IP<P, F>> for Ether {
     }
 }
 
-impl<
-        P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>,
-        F: Fn(Ipv4Addr) -> P::Address,
-        T,
-    > SupportedConfiguration<UDP<T>> for IP<P, F>
-{
-    fn get_config() -> Self::ConnectionConfig {
-        IPConnectionConfig {
-            protocol: pnet_packet::ip::IpNextHeaderProtocols::Udp,
-        }
-    }
-}
 #[async_trait]
 impl Protocol for Ether {
     type Address = MacAddr;
@@ -239,6 +258,20 @@ impl Protocol for Ether {
         connection.sender.send(packet.packet().to_vec()).unwrap();
     }
 }
+
+impl<
+        P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>,
+        F: Fn(Ipv4Addr) -> P::Address,
+        T,
+    > SupportedConfiguration<UDP<T>> for IP<P, F>
+{
+    fn get_config() -> Self::ConnectionConfig {
+        IPConnectionConfig {
+            protocol: pnet_packet::ip::IpNextHeaderProtocols::Udp,
+        }
+    }
+}
+
 #[async_trait]
 impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address>
     Protocol for IP<P, F>
@@ -272,6 +305,7 @@ impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>, F: Fn(Ipv4Addr)
         loop {
             let data = P::receive(&mut connection.connection).await;
             let packet = pnet_packet::ipv4::Ipv4Packet::new(&data).unwrap();
+            println!("{:?}", packet);
             if packet.get_source() == connection.destination_ip
                 && packet.get_destination() == connection.source_ip
                 && connection.config.protocol == packet.get_next_level_protocol()
@@ -291,6 +325,7 @@ impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>, F: Fn(Ipv4Addr)
         packet.set_next_level_protocol(connection.config.protocol);
         packet.set_source(connection.source_ip);
         packet.set_destination(connection.destination_ip);
+        packet.set_payload(data);
         let checksum = pnet_packet::ipv4::checksum(&packet.to_immutable());
         packet.set_checksum(checksum);
         let packet_vec = packet.packet().to_vec();

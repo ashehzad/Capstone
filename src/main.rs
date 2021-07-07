@@ -87,6 +87,18 @@ pub trait Bind: Protocol {
     async fn listen(connection: &mut Self::ServerConnection) -> Self::Connection;
 }
 
+// will the listen function be called at each layer of the protocol? or call it once and then set
+// up the entire connection, and hand that back...The second option would mean that I parse the
+// entire packet and find out the type of connection ... :/
+
+pub struct ServerConnection<P: Protocol> {
+    connection: P::Connection,
+    source_port: u16,
+    destination_port: u16,
+    destination_address: P::Address,
+    source_address: P::Address,
+}
+
 // Currently failure is not built into the system, so like what happens if it fails to send etc
 // So, the thing with UDP is that ut us really meant to send individual packets, and not streams
 // of data, so we only need to worry about a packet at a time.

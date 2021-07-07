@@ -59,9 +59,9 @@ async fn main() {
     );
     UDP::send(&connection_1, &data).await;
     println!("Hello");
-    let recieved = UDP::receive(&mut connection_2).await;
-    println!("Not received");
-    println!("{:?}", recieved);
+    let mut buffer = Vec::new();
+    UDP::receive(&mut connection_2, &mut buffer).await;
+    println!("{:?}", buffer);
 }
 // Use of this trait allows the functions to be async. The reason why the functions should be
 // async is so that I do not have to deal with multithreading.
@@ -69,7 +69,6 @@ async fn main() {
 pub trait Protocol {
     type Address: Copy + Send + Sync;
     type Connection: Send + Sync;
-    type Data;
     type ConnectionConfig;
 
     fn connect(
@@ -78,8 +77,8 @@ pub trait Protocol {
         destination_address: Self::Address,
         connection_config: Self::ConnectionConfig,
     ) -> Self::Connection;
-    async fn receive(connection: &mut Self::Connection) -> Self::Data;
-    async fn send(connection: &Self::Connection, data: &Self::Data);
+    async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>);
+    async fn send(connection: &Self::Connection, data: &[u8]);
 }
 #[async_trait]
 pub trait Bind: Protocol {
@@ -89,14 +88,15 @@ pub trait Bind: Protocol {
 }
 
 // Currently failure is not built into the system, so like what happens if it fails to send etc
+// So, the thing with UDP is that ut us really meant to send individual packets, and not streams
+// of data, so we only need to worry about a packet at a time.
 #[async_trait]
-impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>> Protocol for UDP<P>
+impl<P: Protocol + SupportedConfiguration<Self>> Protocol for UDP<P>
 where
     Self: UDPChecksum<P>,
 {
     type Address = (P::Address, u16);
     type Connection = UDPConnection<P>;
-    type Data = Vec<u8>;
     type ConnectionConfig = ();
 
     fn connect(
@@ -118,20 +118,25 @@ where
         }
     }
 
-    async fn receive(connection: &mut Self::Connection) -> Self::Data {
+    async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
         loop {
-            let data = P::receive(&mut connection.connection).await;
-            let packet = pnet_packet::udp::UdpPacket::new(&data).unwrap();
+            // Here i should maybe just use a new vector, because I want a mut buffer, and I
+            // can't keep on handing stuff out... but lets try it first.
+            // So after recieve I have the buffer, and now I can maybe use it to make the new packet
+            let mut underlying_buffer = Vec::new();
+            P::receive(&mut connection.connection, &mut underlying_buffer).await;
+            let packet = pnet_packet::udp::UdpPacket::new(&underlying_buffer).unwrap(); // <---
+                                                                                        // seems to be ok for now, but might have issues?
             println!("{:?}", packet);
             if packet.get_source() == connection.destination_port
                 && packet.get_destination() == connection.source_port
             {
-                return packet.payload().to_vec();
+                return buffer.append(&mut packet.payload().to_vec());
             }
         }
     }
 
-    async fn send(connection: &Self::Connection, data: &Self::Data) {
+    async fn send(connection: &Self::Connection, data: &[u8]) {
         let packet_buffer = vec![0; 8 + data.len()];
         let packet_total_len = packet_buffer.len();
         let mut packet = pnet_packet::udp::MutableUdpPacket::owned(packet_buffer).unwrap();
@@ -158,11 +163,8 @@ pub trait UDPChecksum<P: Protocol> {
     ) -> u16;
 }
 
-impl<
-        P: Protocol<Data = Vec<u8>> + SupportedConfiguration<IP<P, F>>,
-        F: Fn(Ipv4Addr) -> P::Address,
-        T,
-    > UDPChecksum<IP<P, F>> for UDP<T>
+impl<P: Protocol + SupportedConfiguration<IP<P, F>>, F: Fn(Ipv4Addr) -> P::Address, T>
+    UDPChecksum<IP<P, F>> for UDP<T>
 {
     fn calculate_checksum(
         packet: pnet_packet::udp::UdpPacket,
@@ -170,15 +172,6 @@ impl<
         destination_address: <IP<P, F> as Protocol>::Address,
     ) -> u16 {
         pnet_packet::udp::ipv4_checksum(&packet, &source_address, &destination_address)
-    }
-}
-
-impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>> Transport for UDP<P>
-where
-    Self: UDPChecksum<P>,
-{
-    fn listen(&self, address: Self::Address) -> Box<dyn Stream<Item = Self::Connection>> {
-        todo!()
     }
 }
 
@@ -214,7 +207,6 @@ impl<P, F> SupportedConfiguration<IP<P, F>> for Ether {
 impl Protocol for Ether {
     type Address = MacAddr;
     type Connection = EtherConnection;
-    type Data = Vec<u8>;
     type ConnectionConfig = EtherConnectionConfig;
 
     fn connect(
@@ -232,7 +224,7 @@ impl Protocol for Ether {
         }
     }
 
-    async fn receive(connection: &mut Self::Connection) -> Self::Data {
+    async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
         loop {
             let data = connection.receiver.recv().await.unwrap();
             let packet = pnet_packet::ethernet::EthernetPacket::new(&data).unwrap();
@@ -242,12 +234,14 @@ impl Protocol for Ether {
                 && packet_destination == connection.source_mac
                 && packet.get_ethertype() == connection.config.ether_type
             {
-                return packet.payload().to_vec();
+                buffer.append(&mut packet.payload().to_vec());
+                return;
             }
+            println!("Ether");
         }
     }
 
-    async fn send(connection: &Self::Connection, data: &Self::Data) {
+    async fn send(connection: &Self::Connection, data: &[u8]) {
         let packet_buffer = vec![0; 22 + data.len()];
         let mut packet =
             pnet_packet::ethernet::MutableEthernetPacket::owned(packet_buffer).unwrap();
@@ -259,11 +253,8 @@ impl Protocol for Ether {
     }
 }
 
-impl<
-        P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>,
-        F: Fn(Ipv4Addr) -> P::Address,
-        T,
-    > SupportedConfiguration<UDP<T>> for IP<P, F>
+impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address, T>
+    SupportedConfiguration<UDP<T>> for IP<P, F>
 {
     fn get_config() -> Self::ConnectionConfig {
         IPConnectionConfig {
@@ -273,16 +264,13 @@ impl<
 }
 
 #[async_trait]
-impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address>
-    Protocol for IP<P, F>
+impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address> Protocol
+    for IP<P, F>
 {
     type Address = Ipv4Addr;
     type Connection = IPConnection<P>;
-    type Data = Vec<u8>;
     type ConnectionConfig = IPConnectionConfig;
 
-    // The source and destination address for the inner protocol will be the MAC address, and so
-    // there type is not what is the type listed here.
     fn connect(
         &self,
         source_address: Self::Address,
@@ -301,21 +289,23 @@ impl<P: Protocol<Data = Vec<u8>> + SupportedConfiguration<Self>, F: Fn(Ipv4Addr)
         }
     }
 
-    async fn receive(connection: &mut Self::Connection) -> Self::Data {
+    async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
         loop {
-            let data = P::receive(&mut connection.connection).await;
-            let packet = pnet_packet::ipv4::Ipv4Packet::new(&data).unwrap();
+            let mut underlying_buffer = Vec::new();
+            P::receive(&mut connection.connection, &mut underlying_buffer).await;
+            println!("Post Ether");
+            let packet = pnet_packet::ipv4::Ipv4Packet::new(&underlying_buffer).unwrap();
             println!("{:?}", packet);
             if packet.get_source() == connection.destination_ip
                 && packet.get_destination() == connection.source_ip
                 && connection.config.protocol == packet.get_next_level_protocol()
             {
-                return packet.payload().to_vec();
+                return buffer.append(&mut packet.payload().to_vec());
             }
         }
     }
 
-    async fn send(connection: &Self::Connection, data: &Self::Data) {
+    async fn send(connection: &Self::Connection, data: &[u8]) {
         let packet_buffer = vec![0; 20 + data.len()];
         let packet_total_len = packet_buffer.len();
         let mut packet = pnet_packet::ipv4::MutableIpv4Packet::owned(packet_buffer).unwrap();
@@ -359,11 +349,5 @@ pub struct UDP<P> {
 
 pub struct IP<P, F> {
     inner_protocol: P,
-    address_translator: F, // THIS NEEDS TO BE IMPLEMENTED
-                           //maybe have a ARP table like thing, where when you start uo you register ourself, with mac +
-                           // Ip and when you finish you delete entry, and then this function can look it up
+    address_translator: F,
 }
-
-pub trait Network: Protocol {}
-
-pub trait Link: Protocol {}

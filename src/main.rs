@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use pnet_base::MacAddr;
 use pnet_packet::Packet;
+use std::fmt::{Debug, Formatter};
 use std::net::Ipv4Addr;
 use tokio::sync::broadcast;
 use tokio_stream::Stream;
@@ -44,6 +45,7 @@ async fn main() {
     let udp_2 = UDP {
         inner_protocol: ip_2,
     };
+    let mut server_connection = udp_2.bind((Ipv4Addr::new(190, 16, 16, 16), 80));
 
     let connection_1 = udp_1.connect(
         (Ipv4Addr::new(192, 16, 16, 16), 80),
@@ -51,14 +53,13 @@ async fn main() {
         (),
     );
     let data = vec![1, 2, 4];
-
-    let mut connection_2 = udp_2.connect(
-        (Ipv4Addr::new(190, 16, 16, 16), 80),
-        (Ipv4Addr::new(192, 16, 16, 16), 80),
-        (),
-    );
     UDP::send(&connection_1, &data).await;
+    let mut connection_2 = udp_2.next(&mut server_connection).await;
+
     println!("Hello");
+
+    println!("{:#?}", connection_1);
+    println!("{:#?}", connection_2);
     let mut buffer = Vec::new();
     UDP::receive(&mut connection_2, &mut buffer).await;
     println!("{:?}", buffer);
@@ -80,23 +81,146 @@ pub trait Protocol {
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>);
     async fn send(connection: &Self::Connection, data: &[u8]);
 }
+
 #[async_trait]
 pub trait Bind: Protocol {
     type ServerConnection: Send + Sync;
-    fn bind(address: Self::Address) -> Self::ServerConnection;
-    async fn listen(connection: &mut Self::ServerConnection) -> Self::Connection;
+    fn bind(&self, address: Self::Address) -> Self::ServerConnection;
+    async fn next(&self, connection: &mut Self::ServerConnection) -> Self::Connection;
 }
 
-// will the listen function be called at each layer of the protocol? or call it once and then set
-// up the entire connection, and hand that back...The second option would mean that I parse the
-// entire packet and find out the type of connection ... :/
+#[async_trait]
+impl<P: Listener + SupportedConfiguration<Self>> Bind for UDP<P>
+where
+    Self: UDPChecksum<P>,
+    P: Sync,
+{
+    type ServerConnection = UDPServerConnection<P>;
 
-pub struct ServerConnection<P: Protocol> {
-    connection: P::Connection,
+    fn bind(&self, (address, port): Self::Address) -> Self::ServerConnection {
+        UDPServerConnection {
+            source_port: port,
+            source_address: address,
+            inner_connection: self.inner_protocol.listen(address, P::get_config()),
+        }
+    }
+
+    async fn next(&self, connection: &mut Self::ServerConnection) -> Self::Connection {
+        loop {
+            //if check set
+            let mut buffer = Vec::new();
+            let sender_address = P::next(&mut connection.inner_connection, &mut buffer).await;
+            let packet = pnet_packet::udp::UdpPacket::new(&buffer).unwrap();
+            if packet.get_destination() == connection.source_port {
+                return UDPConnection {
+                    connection: self.inner_protocol.connect(
+                        connection.source_address,
+                        sender_address,
+                        P::get_config(),
+                    ),
+                    cached_payload: Some(packet.payload().to_vec()),
+                    source_port: connection.source_port,
+                    destination_port: packet.get_source(),
+                    destination_address: sender_address,
+                    source_address: connection.source_address,
+                };
+            }
+        }
+    }
+}
+
+pub struct UDPServerConnection<P: Listener> {
     source_port: u16,
-    destination_port: u16,
-    destination_address: P::Address,
     source_address: P::Address,
+    inner_connection: P::ListenConnection,
+}
+
+#[async_trait]
+pub trait Listener: Protocol {
+    type ListenConnection: Send + Sync;
+    fn listen(
+        &self,
+        address: Self::Address,
+        config: Self::ConnectionConfig,
+    ) -> Self::ListenConnection;
+    async fn next(connection: &mut Self::ListenConnection, buffer: &mut Vec<u8>) -> Self::Address;
+}
+#[async_trait]
+impl Listener for Ether {
+    type ListenConnection = EtherListenConnection;
+
+    fn listen(
+        &self,
+        address: Self::Address,
+        config: Self::ConnectionConfig,
+    ) -> Self::ListenConnection {
+        EtherListenConnection {
+            source_address: address,
+            config,
+            receiver: self.sender.subscribe(),
+        }
+    }
+
+    async fn next(connection: &mut Self::ListenConnection, buffer: &mut Vec<u8>) -> Self::Address {
+        loop {
+            let data = connection.receiver.recv().await.unwrap();
+            let packet = pnet_packet::ethernet::EthernetPacket::new(&data).unwrap();
+            let packet_source = packet.get_source();
+            let packet_destination = packet.get_destination();
+            if packet_destination == connection.source_address
+                && packet.get_ethertype() == connection.config.ether_type
+            {
+                buffer.extend_from_slice(packet.payload());
+                return packet_source;
+            }
+        }
+    }
+}
+#[async_trait]
+impl<P: Listener + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address> Listener
+    for IP<P, F>
+{
+    type ListenConnection = IPListenConnection<P>;
+
+    fn listen(
+        &self,
+        address: Self::Address,
+        config: Self::ConnectionConfig,
+    ) -> Self::ListenConnection {
+        IPListenConnection {
+            source_address: address,
+            config,
+            inner_connection: self
+                .inner_protocol
+                .listen((self.address_translator)(address), P::get_config()),
+        }
+    }
+
+    async fn next(connection: &mut Self::ListenConnection, buffer: &mut Vec<u8>) -> Self::Address {
+        loop {
+            let mut underlying_data = Vec::new();
+            P::next(&mut connection.inner_connection, &mut underlying_data).await;
+            let packet = pnet_packet::ipv4::Ipv4Packet::new(&underlying_data).unwrap();
+            if packet.get_destination() == connection.source_address
+                && connection.config.protocol == packet.get_next_level_protocol()
+            {
+                buffer.extend_from_slice(packet.payload());
+                return packet.get_source();
+            }
+        }
+    }
+}
+
+pub struct IPListenConnection<P: Listener> {
+    source_address: Ipv4Addr,
+    config: IPConnectionConfig,
+    inner_connection: P::ListenConnection,
+}
+
+pub struct EtherListenConnection {
+    source_address: MacAddr,
+    config: EtherConnectionConfig,
+    receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
 }
 
 // Currently failure is not built into the system, so like what happens if it fails to send etc
@@ -124,6 +248,7 @@ where
                 P::get_config(),
             ),
             source_port,
+            cached_payload: None,
             destination_port,
             destination_address,
             source_address,
@@ -131,19 +256,20 @@ where
     }
 
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
+        if let Some(cached_payload) = connection.cached_payload.take() {
+            buffer.extend(cached_payload);
+            return;
+        }
         loop {
-            // Here i should maybe just use a new vector, because I want a mut buffer, and I
-            // can't keep on handing stuff out... but lets try it first.
-            // So after recieve I have the buffer, and now I can maybe use it to make the new packet
             let mut underlying_buffer = Vec::new();
             P::receive(&mut connection.connection, &mut underlying_buffer).await;
-            let packet = pnet_packet::udp::UdpPacket::new(&underlying_buffer).unwrap(); // <---
-                                                                                        // seems to be ok for now, but might have issues?
+            let packet = pnet_packet::udp::UdpPacket::new(&underlying_buffer).unwrap();
             println!("{:?}", packet);
             if packet.get_source() == connection.destination_port
                 && packet.get_destination() == connection.source_port
             {
-                return buffer.append(&mut packet.payload().to_vec());
+                buffer.append(&mut packet.payload().to_vec());
+                return;
             }
         }
     }
@@ -188,6 +314,7 @@ impl<P: Protocol + SupportedConfiguration<IP<P, F>>, F: Fn(Ipv4Addr) -> P::Addre
 }
 
 pub struct UDPConnection<P: Protocol> {
+    cached_payload: Option<Vec<u8>>,
     connection: P::Connection,
     source_port: u16,
     destination_port: u16,
@@ -195,10 +322,26 @@ pub struct UDPConnection<P: Protocol> {
     source_address: P::Address,
 }
 
+impl<P: Protocol> Debug for UDPConnection<P>
+where
+    P::Connection: Debug,
+    P::Address: Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UDPConnection")
+            .field("connection", &self.connection)
+            .field("source_port", &self.source_port)
+            .field("destination_port", &self.destination_port)
+            .field("destination_address", &self.destination_address)
+            .field("source_address", &self.source_address)
+            .finish()
+    }
+}
+#[derive(Debug)]
 pub struct EtherConnectionConfig {
     ether_type: pnet_packet::ethernet::EtherType,
 }
-
+#[derive(Debug)]
 pub struct IPConnectionConfig {
     protocol: pnet_packet::ip::IpNextHeaderProtocol,
 }
@@ -246,8 +389,8 @@ impl Protocol for Ether {
                 && packet_destination == connection.source_mac
                 && packet.get_ethertype() == connection.config.ether_type
             {
-                buffer.append(&mut packet.payload().to_vec());
-                return;
+                buffer.extend_from_slice(packet.payload());
+                return; // To break the loop this return is used
             }
             println!("Ether");
         }
@@ -335,6 +478,21 @@ impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address> 
     }
 }
 
+impl<P: Protocol> Debug for IPConnection<P>
+where
+    P::Connection: Debug,
+    P::Address: Debug,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IPConnection")
+            .field("connection", &self.connection)
+            .field("source_ip", &self.source_ip)
+            .field("destination_ip", &self.destination_ip)
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
 pub struct IPConnection<P: Protocol> {
     connection: P::Connection,
     source_ip: Ipv4Addr,
@@ -342,6 +500,7 @@ pub struct IPConnection<P: Protocol> {
     config: IPConnectionConfig,
 }
 
+#[derive(Debug)]
 pub struct EtherConnection {
     source_mac: MacAddr,
     destination_mac: MacAddr,
@@ -358,7 +517,7 @@ pub struct Ether {
 pub struct UDP<P> {
     inner_protocol: P,
 }
-
+#[derive(Debug)]
 pub struct IP<P, F> {
     inner_protocol: P,
     address_translator: F,

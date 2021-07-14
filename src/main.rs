@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use pnet_base::MacAddr;
 use pnet_packet::Packet;
-use std::fmt::{Debug, Formatter};
+use std::fmt::Debug;
 use std::net::Ipv4Addr;
 use tokio::sync::broadcast;
-use tokio_stream::Stream;
 
+// The main function is used to test the overall program. It is used to create the different
+// levels of the protocol, and then send/receive data.
 #[tokio::main]
 async fn main() {
     let (tx, rx1) = broadcast::channel(16);
@@ -56,39 +57,33 @@ async fn main() {
     UDP::send(&connection_1, &data).await;
     let mut connection_2 = udp_2.next(&mut server_connection).await;
 
-    println!("Hello");
-
-    println!("{:#?}", connection_1);
-    println!("{:#?}", connection_2);
     let mut buffer = Vec::new();
     UDP::receive(&mut connection_2, &mut buffer).await;
     println!("{:?}", buffer);
 }
-// Use of this trait allows the functions to be async. The reason why the functions should be
-// async is so that I do not have to deal with multithreading.
-#[async_trait]
-pub trait Protocol {
-    type Address: Copy + Send + Sync;
-    type Connection: Send + Sync;
-    type ConnectionConfig;
 
-    fn connect(
-        &self,
-        source_address: Self::Address,
-        destination_address: Self::Address,
-        connection_config: Self::ConnectionConfig,
-    ) -> Self::Connection;
-    async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>);
-    async fn send(connection: &Self::Connection, data: &[u8]);
-}
+// The code is structured around traits. First Bind, then Listener, and finally Protocol. It can
+// be further subdivided based on the networking layer(ip, etc)
 
+// BIND TRAIT SECTION
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+// This protocol is used by the server to bind to a address and then listen/wait for any
+// connections to that address. Once this is done, the server can then use that connection to
+// communicate with the other address.
 #[async_trait]
 pub trait Bind: Protocol {
+    // A server connection is created and bound to a address and used to listen for new connections
     type ServerConnection: Send + Sync;
+    // bind is used to bind to a specific address and give back a server connection,which is then
+    // used to get new connections
     fn bind(&self, address: Self::Address) -> Self::ServerConnection;
+    // Next is used to listen on the server connection and when new connections are found, this
+    // function returns them to be used.
     async fn next(&self, connection: &mut Self::ServerConnection) -> Self::Connection;
 }
 
+//*****UDP*****
 #[async_trait]
 impl<P: Listener + SupportedConfiguration<Self>> Bind for UDP<P>
 where
@@ -129,12 +124,17 @@ where
     }
 }
 
+// Struct to hold a Server Connection for UDP
 pub struct UDPServerConnection<P: Listener> {
     source_port: u16,
     source_address: P::Address,
     inner_connection: P::ListenConnection,
 }
-
+// LISTENER TRAIT SECTION
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// Trait used for the lower protocols on the server side. To establish a connection, the server
+// side needs to get the addresses for the lower protocols. This trait is used to get those
+// addresses so that the transport layer can establish a connection
 #[async_trait]
 pub trait Listener: Protocol {
     type ListenConnection: Send + Sync;
@@ -145,37 +145,8 @@ pub trait Listener: Protocol {
     ) -> Self::ListenConnection;
     async fn next(connection: &mut Self::ListenConnection, buffer: &mut Vec<u8>) -> Self::Address;
 }
-#[async_trait]
-impl Listener for Ether {
-    type ListenConnection = EtherListenConnection;
 
-    fn listen(
-        &self,
-        address: Self::Address,
-        config: Self::ConnectionConfig,
-    ) -> Self::ListenConnection {
-        EtherListenConnection {
-            source_address: address,
-            config,
-            receiver: self.sender.subscribe(),
-        }
-    }
-
-    async fn next(connection: &mut Self::ListenConnection, buffer: &mut Vec<u8>) -> Self::Address {
-        loop {
-            let data = connection.receiver.recv().await.unwrap();
-            let packet = pnet_packet::ethernet::EthernetPacket::new(&data).unwrap();
-            let packet_source = packet.get_source();
-            let packet_destination = packet.get_destination();
-            if packet_destination == connection.source_address
-                && packet.get_ethertype() == connection.config.ether_type
-            {
-                buffer.extend_from_slice(packet.payload());
-                return packet_source;
-            }
-        }
-    }
-}
+//*****IP*****
 #[async_trait]
 impl<P: Listener + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address> Listener
     for IP<P, F>
@@ -217,15 +188,70 @@ pub struct IPListenConnection<P: Listener> {
     inner_connection: P::ListenConnection,
 }
 
+//*****ETHER*****
+#[async_trait]
+impl Listener for Ether {
+    type ListenConnection = EtherListenConnection;
+
+    fn listen(
+        &self,
+        address: Self::Address,
+        config: Self::ConnectionConfig,
+    ) -> Self::ListenConnection {
+        EtherListenConnection {
+            source_address: address,
+            config,
+            receiver: self.sender.subscribe(),
+        }
+    }
+
+    async fn next(connection: &mut Self::ListenConnection, buffer: &mut Vec<u8>) -> Self::Address {
+        loop {
+            let data = connection.receiver.recv().await.unwrap();
+            let packet = pnet_packet::ethernet::EthernetPacket::new(&data).unwrap();
+            let packet_source = packet.get_source();
+            let packet_destination = packet.get_destination();
+            if packet_destination == connection.source_address
+                && packet.get_ethertype() == connection.config.ether_type
+            {
+                buffer.extend_from_slice(packet.payload());
+                return packet_source;
+            }
+        }
+    }
+}
+
 pub struct EtherListenConnection {
     source_address: MacAddr,
     config: EtherConnectionConfig,
     receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
 }
 
+// PROTOCOL TRAIT SECTION
+//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// The protocol trait is implemented by all levels of the networking stack. It contains methods
+// to connect with a remote address, and then using that connection send and receive data.
+#[async_trait]
+pub trait Protocol {
+    type Address: Copy + Send + Sync;
+    type Connection: Send + Sync;
+    type ConnectionConfig;
+
+    fn connect(
+        &self,
+        source_address: Self::Address,
+        destination_address: Self::Address,
+        connection_config: Self::ConnectionConfig,
+    ) -> Self::Connection;
+    async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>);
+    async fn send(connection: &Self::Connection, data: &[u8]);
+}
+
 // Currently failure is not built into the system, so like what happens if it fails to send etc
 // So, the thing with UDP is that ut us really meant to send individual packets, and not streams
 // of data, so we only need to worry about a packet at a time.
+
+//*****UDP*****
 #[async_trait]
 impl<P: Protocol + SupportedConfiguration<Self>> Protocol for UDP<P>
 where
@@ -322,101 +348,12 @@ pub struct UDPConnection<P: Protocol> {
     source_address: P::Address,
 }
 
-impl<P: Protocol> Debug for UDPConnection<P>
-where
-    P::Connection: Debug,
-    P::Address: Debug,
-{
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UDPConnection")
-            .field("connection", &self.connection)
-            .field("source_port", &self.source_port)
-            .field("destination_port", &self.destination_port)
-            .field("destination_address", &self.destination_address)
-            .field("source_address", &self.source_address)
-            .finish()
-    }
-}
-#[derive(Debug)]
-pub struct EtherConnectionConfig {
-    ether_type: pnet_packet::ethernet::EtherType,
-}
-#[derive(Debug)]
-pub struct IPConnectionConfig {
-    protocol: pnet_packet::ip::IpNextHeaderProtocol,
+pub struct UDP<P> {
+    inner_protocol: P,
 }
 
-pub trait SupportedConfiguration<P>: Protocol {
-    fn get_config() -> Self::ConnectionConfig;
-}
-
-impl<P, F> SupportedConfiguration<IP<P, F>> for Ether {
-    fn get_config() -> Self::ConnectionConfig {
-        EtherConnectionConfig {
-            ether_type: pnet_packet::ethernet::EtherTypes::Ipv4,
-        }
-    }
-}
-
-#[async_trait]
-impl Protocol for Ether {
-    type Address = MacAddr;
-    type Connection = EtherConnection;
-    type ConnectionConfig = EtherConnectionConfig;
-
-    fn connect(
-        &self,
-        source_address: Self::Address,
-        destination_address: Self::Address,
-        connection_config: Self::ConnectionConfig,
-    ) -> Self::Connection {
-        EtherConnection {
-            source_mac: source_address,
-            destination_mac: destination_address,
-            config: connection_config,
-            sender: self.sender.clone(),
-            receiver: self.sender.subscribe(),
-        }
-    }
-
-    async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
-        loop {
-            let data = connection.receiver.recv().await.unwrap();
-            let packet = pnet_packet::ethernet::EthernetPacket::new(&data).unwrap();
-            let packet_source = packet.get_source();
-            let packet_destination = packet.get_destination();
-            if packet_source == connection.destination_mac
-                && packet_destination == connection.source_mac
-                && packet.get_ethertype() == connection.config.ether_type
-            {
-                buffer.extend_from_slice(packet.payload());
-                return; // To break the loop this return is used
-            }
-            println!("Ether");
-        }
-    }
-
-    async fn send(connection: &Self::Connection, data: &[u8]) {
-        let packet_buffer = vec![0; 22 + data.len()];
-        let mut packet =
-            pnet_packet::ethernet::MutableEthernetPacket::owned(packet_buffer).unwrap();
-        packet.set_source(connection.source_mac);
-        packet.set_destination(connection.destination_mac);
-        packet.set_ethertype(connection.config.ether_type);
-        packet.set_payload(data);
-        connection.sender.send(packet.packet().to_vec()).unwrap();
-    }
-}
-
-impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address, T>
-    SupportedConfiguration<UDP<T>> for IP<P, F>
-{
-    fn get_config() -> Self::ConnectionConfig {
-        IPConnectionConfig {
-            protocol: pnet_packet::ip::IpNextHeaderProtocols::Udp,
-        }
-    }
-}
+//*****IP*****
+//-----------------------------------------------------------------------------------------------
 
 #[async_trait]
 impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address> Protocol
@@ -478,26 +415,92 @@ impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address> 
     }
 }
 
-impl<P: Protocol> Debug for IPConnection<P>
-where
-    P::Connection: Debug,
-    P::Address: Debug,
-{
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IPConnection")
-            .field("connection", &self.connection)
-            .field("source_ip", &self.source_ip)
-            .field("destination_ip", &self.destination_ip)
-            .field("config", &self.config)
-            .finish()
-    }
-}
-
 pub struct IPConnection<P: Protocol> {
     connection: P::Connection,
     source_ip: Ipv4Addr,
     destination_ip: Ipv4Addr,
     config: IPConnectionConfig,
+}
+
+#[derive(Debug)]
+pub struct IP<P, F> {
+    inner_protocol: P,
+    address_translator: F,
+}
+
+#[derive(Debug)]
+pub struct IPConnectionConfig {
+    protocol: pnet_packet::ip::IpNextHeaderProtocol,
+}
+
+// Trait used to get the underlying connection configuration(Ether, Ipv4 etc)
+pub trait SupportedConfiguration<P>: Protocol {
+    fn get_config() -> Self::ConnectionConfig;
+}
+
+//*****ETHER*****
+//-------------------------------------------------------------------------------------------------
+#[async_trait]
+impl Protocol for Ether {
+    type Address = MacAddr;
+    type Connection = EtherConnection;
+    type ConnectionConfig = EtherConnectionConfig;
+
+    fn connect(
+        &self,
+        source_address: Self::Address,
+        destination_address: Self::Address,
+        connection_config: Self::ConnectionConfig,
+    ) -> Self::Connection {
+        EtherConnection {
+            source_mac: source_address,
+            destination_mac: destination_address,
+            config: connection_config,
+            sender: self.sender.clone(),
+            receiver: self.sender.subscribe(),
+        }
+    }
+
+    async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
+        loop {
+            let data = connection.receiver.recv().await.unwrap();
+            let packet = pnet_packet::ethernet::EthernetPacket::new(&data).unwrap();
+            let packet_source = packet.get_source();
+            let packet_destination = packet.get_destination();
+            if packet_source == connection.destination_mac
+                && packet_destination == connection.source_mac
+                && packet.get_ethertype() == connection.config.ether_type
+            {
+                buffer.extend_from_slice(packet.payload());
+                return;
+            }
+            println!("Ether");
+        }
+    }
+
+    async fn send(connection: &Self::Connection, data: &[u8]) {
+        let packet_buffer = vec![0; 22 + data.len()];
+        let mut packet =
+            pnet_packet::ethernet::MutableEthernetPacket::owned(packet_buffer).unwrap();
+        packet.set_source(connection.source_mac);
+        packet.set_destination(connection.destination_mac);
+        packet.set_ethertype(connection.config.ether_type);
+        packet.set_payload(data);
+        connection.sender.send(packet.packet().to_vec()).unwrap();
+    }
+}
+
+impl<P, F> SupportedConfiguration<IP<P, F>> for Ether {
+    fn get_config() -> Self::ConnectionConfig {
+        EtherConnectionConfig {
+            ether_type: pnet_packet::ethernet::EtherTypes::Ipv4,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct EtherConnectionConfig {
+    ether_type: pnet_packet::ethernet::EtherType,
 }
 
 #[derive(Debug)]
@@ -514,11 +517,12 @@ pub struct Ether {
     receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
 }
 
-pub struct UDP<P> {
-    inner_protocol: P,
-}
-#[derive(Debug)]
-pub struct IP<P, F> {
-    inner_protocol: P,
-    address_translator: F,
+impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address, T>
+    SupportedConfiguration<UDP<T>> for IP<P, F>
+{
+    fn get_config() -> Self::ConnectionConfig {
+        IPConnectionConfig {
+            protocol: pnet_packet::ip::IpNextHeaderProtocols::Udp,
+        }
+    }
 }

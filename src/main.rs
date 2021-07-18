@@ -48,11 +48,13 @@ async fn main() {
     };
     let mut server_connection = udp_2.bind((Ipv4Addr::new(190, 16, 16, 16), 80));
 
-    let mut connection_1 = udp_1.connect(
-        (Ipv4Addr::new(192, 16, 16, 16), 80),
-        (Ipv4Addr::new(190, 16, 16, 16), 80),
-        (),
-    );
+    let mut connection_1 = udp_1
+        .connect(
+            (Ipv4Addr::new(192, 16, 16, 16), 80),
+            (Ipv4Addr::new(190, 16, 16, 16), 80),
+            (),
+        )
+        .await;
     let mut data = vec![1, 2, 4];
     UDP::send(&connection_1, &data).await;
     let mut connection_2 = udp_2.next(&mut server_connection).await;
@@ -72,8 +74,6 @@ async fn main() {
     UDP::send(&connection_1, &data).await;
     UDP::receive(&mut connection_2, &mut buffer).await;
     println!("{:?}", buffer);
-    // If we pass in the same buffer, we will simply extend the older one, hmm, should that be
-    // allowed, will it be expected that a new buffer is given each time?
 }
 
 // The code is structured around traits. First Bind, then Listener, and finally Protocol. It can
@@ -122,11 +122,10 @@ where
             let packet = pnet_packet::udp::UdpPacket::new(&buffer).unwrap();
             if packet.get_destination() == connection.source_port {
                 return UDPConnection {
-                    connection: self.inner_protocol.connect(
-                        connection.source_address,
-                        sender_address,
-                        P::get_config(),
-                    ),
+                    connection: self
+                        .inner_protocol
+                        .connect(connection.source_address, sender_address, P::get_config())
+                        .await,
                     cached_payload: Some(packet.payload().to_vec()),
                     source_port: connection.source_port,
                     destination_port: packet.get_source(),
@@ -144,6 +143,9 @@ pub struct UDPServerConnection<P: Listener> {
     source_address: P::Address,
     inner_connection: P::ListenConnection,
 }
+
+//*****UDP*****
+
 // LISTENER TRAIT SECTION
 //+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 // Trait used for the lower protocols on the server side. To establish a connection, the server
@@ -162,8 +164,8 @@ pub trait Listener: Protocol {
 
 //*****IP*****
 #[async_trait]
-impl<P: Listener + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address> Listener
-    for IP<P, F>
+impl<P: Listener + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address + Send + Sync>
+    Listener for IP<P, F>
 {
     type ListenConnection = IPListenConnection<P>;
 
@@ -246,12 +248,12 @@ pub struct EtherListenConnection {
 // The protocol trait is implemented by all levels of the networking stack. It contains methods
 // to connect with a remote address, and then using that connection send and receive data.
 #[async_trait]
-pub trait Protocol {
+pub trait Protocol: Send + Sync {
     type Address: Copy + Send + Sync;
     type Connection: Send + Sync;
-    type ConnectionConfig;
+    type ConnectionConfig: Send;
 
-    fn connect(
+    async fn connect(
         &self,
         source_address: Self::Address,
         destination_address: Self::Address,
@@ -275,18 +277,17 @@ where
     type Connection = UDPConnection<P>;
     type ConnectionConfig = ();
 
-    fn connect(
+    async fn connect(
         &self,
         (source_address, source_port): Self::Address,
         (destination_address, destination_port): Self::Address,
         connection_config: Self::ConnectionConfig,
     ) -> Self::Connection {
         UDPConnection {
-            connection: self.inner_protocol.connect(
-                source_address,
-                destination_address,
-                P::get_config(),
-            ),
+            connection: self
+                .inner_protocol
+                .connect(source_address, destination_address, P::get_config())
+                .await,
             source_port,
             cached_payload: None,
             destination_port,
@@ -341,8 +342,11 @@ pub trait UDPChecksum<P: Protocol> {
     ) -> u16;
 }
 
-impl<P: Protocol + SupportedConfiguration<IP<P, F>>, F: Fn(Ipv4Addr) -> P::Address, T>
-    UDPChecksum<IP<P, F>> for UDP<T>
+impl<
+        P: Protocol + SupportedConfiguration<IP<P, F>>,
+        F: Fn(Ipv4Addr) -> P::Address + Send + Sync,
+        T,
+    > UDPChecksum<IP<P, F>> for UDP<T>
 {
     fn calculate_checksum(
         packet: pnet_packet::udp::UdpPacket,
@@ -378,7 +382,7 @@ where
     type Connection = TCPConnection<P>;
     type ConnectionConfig = ();
 
-    fn connect(
+    async fn connect(
         &self,
         (source_address, source_port): Self::Address,
         (destination_address, destination_port): Self::Address,
@@ -391,13 +395,41 @@ where
 
         // Issue here is that there is no idea what the underlying connection is
         // if we fix it to be just IP connection,then we move away from the modular system.
-        let ip_connection =
-            self.inner_protocol
-                .connect(source_address, destination_address, P::get_config());
-        let first_packet = vec![1, 2, 4];
-        IP::send(&ip_connection, &first_packet);
+        let mut ip_connection = self
+            .inner_protocol
+            .connect(source_address, destination_address, P::get_config())
+            .await;
+        let mut packet_buffer = vec![0; 20];
+        let mut syn_packet = pnet_packet::tcp::MutableTcpPacket::new(&mut packet_buffer).unwrap();
+        syn_packet.set_source(source_port);
+        syn_packet.set_destination(destination_port);
+        syn_packet.set_flags(2);
+        syn_packet.set_sequence(0);
+        P::send(&ip_connection, syn_packet.packet()).await;
+        packet_buffer.clear();
+        P::receive(&mut ip_connection, &mut packet_buffer).await;
+        let syn_ack_packet = pnet_packet::tcp::TcpPacket::new(&packet_buffer).unwrap();
+        let flags = syn_ack_packet.get_flags();
+        let is_ack = flags & 0b10 != 0;
+        let is_syn = flags & 0b10000 != 0;
 
-        todo!()
+        if !is_ack || !is_syn {
+            panic!()
+        }
+        packet_buffer.clear();
+        let mut ack_packet = pnet_packet::tcp::MutableTcpPacket::new(&mut packet_buffer).unwrap();
+        ack_packet.set_source(source_port);
+        ack_packet.set_destination(destination_port);
+        ack_packet.set_flags(1 << 0000);
+        ack_packet.set_sequence(0);
+        P::send(&ip_connection, ack_packet.packet()).await;
+        TCPConnection {
+            connection: ip_connection,
+            source_port,
+            destination_port,
+            destination_address,
+            source_address,
+        }
     }
 
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
@@ -409,8 +441,6 @@ where
     }
 }
 
-// Should this function and maybe the overall thing assume it will run over IP?
-pub fn make_handshake_packet(source_address:) {}
 pub trait TCPChecksum<P: Protocol> {
     fn calculate_checksum(
         packet: pnet_packet::tcp::TcpPacket,
@@ -419,8 +449,11 @@ pub trait TCPChecksum<P: Protocol> {
     ) -> u16;
 }
 
-impl<P: Protocol + SupportedConfiguration<IP<P, F>>, F: Fn(Ipv4Addr) -> P::Address, T>
-    TCPChecksum<IP<P, F>> for TCP<T>
+impl<
+        P: Protocol + SupportedConfiguration<IP<P, F>>,
+        F: Fn(Ipv4Addr) -> P::Address + Send + Sync,
+        T,
+    > TCPChecksum<IP<P, F>> for TCP<T>
 {
     fn calculate_checksum(
         packet: pnet_packet::tcp::TcpPacket,
@@ -432,7 +465,6 @@ impl<P: Protocol + SupportedConfiguration<IP<P, F>>, F: Fn(Ipv4Addr) -> P::Addre
 }
 
 pub struct TCPConnection<P: Protocol> {
-    cached_payload: Option<Vec<u8>>,
     connection: P::Connection,
     source_port: u16,
     destination_port: u16,
@@ -448,25 +480,28 @@ pub struct TCP<P> {
 //-----------------------------------------------------------------------------------------------
 
 #[async_trait]
-impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address> Protocol
-    for IP<P, F>
+impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address + Send + Sync>
+    Protocol for IP<P, F>
 {
     type Address = Ipv4Addr;
     type Connection = IPConnection<P>;
     type ConnectionConfig = IPConnectionConfig;
 
-    fn connect(
+    async fn connect(
         &self,
         source_address: Self::Address,
         destination_address: Self::Address,
         connection_config: Self::ConnectionConfig,
     ) -> Self::Connection {
         IPConnection {
-            connection: self.inner_protocol.connect(
-                (self.address_translator)(source_address),
-                (self.address_translator)(destination_address),
-                P::get_config(),
-            ),
+            connection: self
+                .inner_protocol
+                .connect(
+                    (self.address_translator)(source_address),
+                    (self.address_translator)(destination_address),
+                    P::get_config(),
+                )
+                .await,
             source_ip: source_address,
             destination_ip: destination_address,
             config: connection_config,
@@ -536,7 +571,7 @@ impl Protocol for Ether {
     type Connection = EtherConnection;
     type ConnectionConfig = EtherConnectionConfig;
 
-    fn connect(
+    async fn connect(
         &self,
         source_address: Self::Address,
         destination_address: Self::Address,
@@ -607,8 +642,11 @@ pub struct Ether {
     receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
 }
 
-impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address, T>
-    SupportedConfiguration<UDP<T>> for IP<P, F>
+impl<
+        P: Protocol + SupportedConfiguration<Self>,
+        F: Fn(Ipv4Addr) -> P::Address + Send + Sync,
+        T,
+    > SupportedConfiguration<UDP<T>> for IP<P, F>
 {
     fn get_config() -> Self::ConnectionConfig {
         IPConnectionConfig {

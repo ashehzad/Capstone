@@ -48,18 +48,32 @@ async fn main() {
     };
     let mut server_connection = udp_2.bind((Ipv4Addr::new(190, 16, 16, 16), 80));
 
-    let connection_1 = udp_1.connect(
+    let mut connection_1 = udp_1.connect(
         (Ipv4Addr::new(192, 16, 16, 16), 80),
         (Ipv4Addr::new(190, 16, 16, 16), 80),
         (),
     );
-    let data = vec![1, 2, 4];
+    let mut data = vec![1, 2, 4];
     UDP::send(&connection_1, &data).await;
     let mut connection_2 = udp_2.next(&mut server_connection).await;
 
     let mut buffer = Vec::new();
     UDP::receive(&mut connection_2, &mut buffer).await;
     println!("{:?}", buffer);
+
+    let mut client_buffer = Vec::new();
+    let server_data = vec![2, 5];
+    UDP::send(&connection_2, &server_data).await;
+    UDP::receive(&mut connection_1, &mut client_buffer).await;
+
+    println!("{:?}", client_buffer);
+
+    data = vec![1, 3, 4, 6];
+    UDP::send(&connection_1, &data).await;
+    UDP::receive(&mut connection_2, &mut buffer).await;
+    println!("{:?}", buffer);
+    // If we pass in the same buffer, we will simply extend the older one, hmm, should that be
+    // allowed, will it be expected that a new buffer is given each time?
 }
 
 // The code is structured around traits. First Bind, then Listener, and finally Protocol. It can
@@ -352,6 +366,84 @@ pub struct UDP<P> {
     inner_protocol: P,
 }
 
+//*****TCP*****
+//-----------------------------------------------------------------------------------------------
+
+#[async_trait]
+impl<P: Protocol + SupportedConfiguration<Self>> Protocol for TCP<P>
+where
+    Self: TCPChecksum<P>,
+{
+    type Address = (P::Address, u16);
+    type Connection = TCPConnection<P>;
+    type ConnectionConfig = ();
+
+    fn connect(
+        &self,
+        (source_address, source_port): Self::Address,
+        (destination_address, destination_port): Self::Address,
+        connection_config: Self::ConnectionConfig,
+    ) -> Self::Connection {
+        //have 3 way handshake here and then at the end return a tcp connection
+        // have a support function that takes the flags to be altered and builds the packets
+        // create the underlying connection, so IP and Ether, but don't finalize the
+        // tcp one until handshake completes
+
+        // Issue here is that there is no idea what the underlying connection is
+        // if we fix it to be just IP connection,then we move away from the modular system.
+        let ip_connection =
+            self.inner_protocol
+                .connect(source_address, destination_address, P::get_config());
+        let first_packet = vec![1, 2, 4];
+        IP::send(&ip_connection, &first_packet);
+
+        todo!()
+    }
+
+    async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
+        todo!()
+    }
+
+    async fn send(connection: &Self::Connection, data: &[u8]) {
+        todo!()
+    }
+}
+
+// Should this function and maybe the overall thing assume it will run over IP?
+pub fn make_handshake_packet(source_address:) {}
+pub trait TCPChecksum<P: Protocol> {
+    fn calculate_checksum(
+        packet: pnet_packet::tcp::TcpPacket,
+        source_address: P::Address,
+        destination_address: P::Address,
+    ) -> u16;
+}
+
+impl<P: Protocol + SupportedConfiguration<IP<P, F>>, F: Fn(Ipv4Addr) -> P::Address, T>
+    TCPChecksum<IP<P, F>> for TCP<T>
+{
+    fn calculate_checksum(
+        packet: pnet_packet::tcp::TcpPacket,
+        source_address: <IP<P, F> as Protocol>::Address,
+        destination_address: <IP<P, F> as Protocol>::Address,
+    ) -> u16 {
+        pnet_packet::tcp::ipv4_checksum(&packet, &source_address, &destination_address)
+    }
+}
+
+pub struct TCPConnection<P: Protocol> {
+    cached_payload: Option<Vec<u8>>,
+    connection: P::Connection,
+    source_port: u16,
+    destination_port: u16,
+    destination_address: P::Address,
+    source_address: P::Address,
+}
+
+pub struct TCP<P> {
+    inner_protocol: P,
+}
+
 //*****IP*****
 //-----------------------------------------------------------------------------------------------
 
@@ -385,9 +477,7 @@ impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address> 
         loop {
             let mut underlying_buffer = Vec::new();
             P::receive(&mut connection.connection, &mut underlying_buffer).await;
-            println!("Post Ether");
             let packet = pnet_packet::ipv4::Ipv4Packet::new(&underlying_buffer).unwrap();
-            println!("{:?}", packet);
             if packet.get_source() == connection.destination_ip
                 && packet.get_destination() == connection.source_ip
                 && connection.config.protocol == packet.get_next_level_protocol()

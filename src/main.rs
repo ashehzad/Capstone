@@ -538,12 +538,41 @@ where
         }
     }
 
+    // add ack and seq numb to the tcp connection struct
+
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
-        todo!()
+        loop {
+            P::receive(&mut connection.connection, buffer).await;
+            let packet = pnet_packet::tcp::TcpPacket::new(buffer).unwrap();
+            if packet.get_source() == connection.destination_port
+                && packet.get_destination() == connection.source_port
+            {
+                let header_length = 20;
+                let payload_length = packet.payload().len();
+                let total_size = header_length + payload_length;
+                buffer.copy_within(header_length..total_size, 0);
+                buffer.truncate(payload_length);
+                return;
+            }
+        }
     }
 
     async fn send(connection: &Self::Connection, data: &mut VecDeque<u8>) {
-        todo!()
+        data.reserve(20);
+        for i in 0..20 {
+            data.push_front(0);
+        }
+        let packet_total_len = data.len();
+        let mut packet = pnet_packet::tcp::MutableTcpPacket::new(data.make_contiguous()).unwrap();
+        packet.set_source(connection.source_port);
+        packet.set_destination(connection.destination_port);
+        let checksum = Self::calculate_checksum(
+            packet.to_immutable(),
+            connection.source_address,
+            connection.destination_address,
+        );
+        packet.set_checksum(checksum);
+        P::send(&connection.connection, data).await;
     }
 }
 
@@ -617,9 +646,7 @@ impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address +
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
         loop {
             P::receive(&mut connection.connection, buffer).await;
-
             let packet = pnet_packet::ipv4::Ipv4Packet::new(buffer).unwrap();
-
             if packet.get_source() == connection.destination_ip
                 && packet.get_destination() == connection.source_ip
                 && connection.config.protocol == packet.get_next_level_protocol()

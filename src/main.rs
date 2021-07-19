@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use pnet_base::MacAddr;
 use pnet_packet::Packet;
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::net::Ipv4Addr;
 use tokio::sync::broadcast;
@@ -65,17 +66,6 @@ async fn main() {
     // UDP::receive(&mut connection_2, &mut buffer).await;
     // println!("{:?}", buffer);
     //
-    // let mut client_buffer = Vec::new();
-    // let server_data = vec![2, 5];
-    // UDP::send(&connection_2, &server_data).await;
-    // UDP::receive(&mut connection_1, &mut client_buffer).await;
-    //
-    // println!("{:?}", client_buffer);
-    //
-    // data = vec![1, 3, 4, 6];
-    // UDP::send(&connection_1, &data).await;
-    // UDP::receive(&mut connection_2, &mut buffer).await;
-    // println!("{:?}", buffer);
 }
 
 // The code is structured around traits. First Bind, then Listener, and finally Protocol. It can
@@ -336,7 +326,10 @@ pub trait Protocol: Send + Sync {
         connection_config: Self::ConnectionConfig,
     ) -> Self::Connection;
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>);
-    async fn send(connection: &Self::Connection, data: &[u8]);
+    async fn send(connection: &Self::Connection, data: &mut VecDeque<u8>);
+    async fn send_slice(connection: &Self::Connection, data: &[u8]) {
+        Self::send(connection, &mut data.to_vec().into());
+    }
 }
 
 // Currently failure is not built into the system, so like what happens if it fails to send etc
@@ -391,22 +384,23 @@ where
         }
     }
 
-    async fn send(connection: &Self::Connection, data: &[u8]) {
-        let packet_buffer = vec![0; 8 + data.len()];
-        let packet_total_len = packet_buffer.len();
-        let mut packet = pnet_packet::udp::MutableUdpPacket::owned(packet_buffer).unwrap();
+    async fn send(connection: &Self::Connection, data: &mut VecDeque<u8>) {
+        data.reserve(8);
+        for i in 0..8 {
+            data.push_front(0);
+        }
+        let packet_total_len = data.len();
+        let mut packet = pnet_packet::udp::MutableUdpPacket::new(data.make_contiguous()).unwrap();
         packet.set_source(connection.source_port);
         packet.set_destination(connection.destination_port);
         packet.set_length(packet_total_len as u16);
-        packet.set_payload(data);
         let checksum = Self::calculate_checksum(
             packet.to_immutable(),
             connection.source_address,
             connection.destination_address,
         );
         packet.set_checksum(checksum);
-        let packet_vec = packet.packet().to_vec();
-        P::send(&connection.connection, &packet_vec).await;
+        P::send(&connection.connection, data).await;
     }
 }
 
@@ -475,7 +469,7 @@ where
         syn_packet.set_flags(2);
         syn_packet.set_sequence(0);
         println!("{:#?}", syn_packet);
-        P::send(&ip_connection, syn_packet.packet()).await;
+        P::send_slice(&ip_connection, syn_packet.packet()).await;
         packet_buffer.clear();
         P::receive(&mut ip_connection, &mut packet_buffer).await;
         let syn_ack_packet = pnet_packet::tcp::TcpPacket::new(&packet_buffer).unwrap();
@@ -493,7 +487,7 @@ where
         ack_packet.set_destination(destination_port);
         ack_packet.set_flags(1 << 4);
         ack_packet.set_acknowledgement(server_seq + 1);
-        P::send(&ip_connection, ack_packet.packet()).await;
+        P::send_slice(&ip_connection, ack_packet.packet()).await;
         TCPConnection {
             connection: ip_connection,
             source_port,
@@ -581,21 +575,24 @@ impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address +
 
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
         loop {
-            let mut underlying_buffer = Vec::new();
-            P::receive(&mut connection.connection, &mut underlying_buffer).await;
-            let packet = pnet_packet::ipv4::Ipv4Packet::new(&underlying_buffer).unwrap();
+            P::receive(&mut connection.connection, buffer).await;
+            let packet = pnet_packet::ipv4::Ipv4Packet::new(buffer).unwrap();
             if packet.get_source() == connection.destination_ip
                 && packet.get_destination() == connection.source_ip
                 && connection.config.protocol == packet.get_next_level_protocol()
             {
-                return buffer.append(&mut packet.payload().to_vec());
+                let header_length = packet.get_header_length() as usize;
+                let payload_length = packet.payload().len();
+                let total_size = header_length + payload_length;
+                buffer.copy_within(header_length..total_size, 0);
+                buffer.truncate(payload_length);
+                return;
             }
         }
     }
 
     async fn send(connection: &Self::Connection, data: &[u8]) {
         let packet_buffer = vec![0; 20 + data.len()];
-        println!("{:?}", data);
         let packet_total_len = packet_buffer.len();
         let mut packet = pnet_packet::ipv4::MutableIpv4Packet::owned(packet_buffer).unwrap();
         packet.set_version(4);
@@ -671,19 +668,18 @@ impl Protocol for Ether {
                 buffer.extend_from_slice(packet.payload());
                 return;
             }
-            println!("Ether");
         }
     }
 
     async fn send(connection: &Self::Connection, data: &[u8]) {
-        let packet_buffer = vec![0; 22 + data.len()];
+        let mut packet_buffer = vec![0; 22 + data.len()];
         let mut packet =
-            pnet_packet::ethernet::MutableEthernetPacket::owned(packet_buffer).unwrap();
+            pnet_packet::ethernet::MutableEthernetPacket::new(&mut packet_buffer).unwrap();
         packet.set_source(connection.source_mac);
         packet.set_destination(connection.destination_mac);
         packet.set_ethertype(connection.config.ether_type);
         packet.set_payload(data);
-        connection.sender.send(packet.packet().to_vec()).unwrap();
+        connection.sender.send(packet_buffer).unwrap();
     }
 }
 

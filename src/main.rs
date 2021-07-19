@@ -4,6 +4,7 @@ use pnet_packet::Packet;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::net::Ipv4Addr;
+use std::panic::panic_any;
 use tokio::sync::broadcast;
 
 // The main function is used to test the overall program. It is used to create the different
@@ -26,7 +27,7 @@ async fn main() {
         },
     };
 
-    let tcp_1 = TCP {
+    let udp_1 = UDP {
         inner_protocol: ip_1,
     };
 
@@ -44,28 +45,28 @@ async fn main() {
         },
     };
 
-    let tcp_2 = TCP {
+    let udp_2 = UDP {
         inner_protocol: ip_2,
     };
-    let mut server_connection = tcp_2.bind((Ipv4Addr::new(190, 16, 16, 16), 80));
+    let mut server_connection = udp_2.bind((Ipv4Addr::new(190, 16, 16, 16), 80));
 
-    let connection_1_future = tcp_1.connect(
-        (Ipv4Addr::new(192, 16, 16, 16), 80),
-        (Ipv4Addr::new(190, 16, 16, 16), 80),
-        (),
-    );
-    // let mut data = vec![1, 2, 4];
-    // TCP::send(&connection_1, &data).await;
-    let connection_2_future = tcp_2.next(&mut server_connection);
+    let connection_1 = udp_1
+        .connect(
+            (Ipv4Addr::new(192, 16, 16, 16), 80),
+            (Ipv4Addr::new(190, 16, 16, 16), 80),
+            (),
+        )
+        .await;
+    let mut data = VecDeque::new();
+    data.push_front(4);
+    data.push_front(2);
+    data.push_front(1);
+    UDP::send(&connection_1, &mut data).await;
+    let mut connection_2 = udp_2.next(&mut server_connection).await;
 
-    let (connection_1, connection_2) = tokio::join!(connection_1_future, connection_2_future);
-
-    println!("MADE CONNECTION");
-
-    // let mut buffer = Vec::new();
-    // UDP::receive(&mut connection_2, &mut buffer).await;
-    // println!("{:?}", buffer);
-    //
+    let mut buffer = Vec::new();
+    UDP::receive(&mut connection_2, &mut buffer).await;
+    println!("{:?}", buffer);
 }
 
 // The code is structured around traits. First Bind, then Listener, and finally Protocol. It can
@@ -152,25 +153,36 @@ where
     }
 
     async fn next(&self, connection: &mut Self::ServerConnection) -> Self::Connection {
-        let mut packet_buffer = vec![0; 20];
+        // Issue is now around the different types of buffers being used
+        // Next for listener expects a Vec, and so does recieve
+        // However, send now expects a Vecdeq. Because they are all used in the TCP
+        // next, either I have two seperate buffers, or revert back...
+        let mut send_packet_buffer: VecDeque<u8> = VecDeque::new();
+        let mut recv_packet_buffer = Vec::new();
         loop {
-            packet_buffer.clear();
-            let sender_address =
-                P::next(&mut connection.inner_connection, &mut packet_buffer).await;
-            println!("{:?}", packet_buffer);
-            let syn_packet = pnet_packet::tcp::TcpPacket::new(&packet_buffer).unwrap();
+            recv_packet_buffer.clear();
 
+            let sender_address =
+                P::next(&mut connection.inner_connection, &mut recv_packet_buffer).await;
+
+            let syn_packet = pnet_packet::tcp::TcpPacket::new(&recv_packet_buffer).unwrap();
             let is_syn = syn_packet.get_flags() & 0b10 != 0;
             let destination_port = syn_packet.get_destination();
             let sender_seq_number = syn_packet.get_sequence();
             let sender_port = syn_packet.get_source();
-            println!("{:#?}", syn_packet);
+            // so again the buffer is messed up and we enter the if statement
+
             if !is_syn || destination_port != connection.source_port {
                 continue;
             }
-            packet_buffer.fill(0);
+            for i in 0..20 {
+                send_packet_buffer.push_front(0);
+            }
+
             let mut syn_ack_packet =
-                pnet_packet::tcp::MutableTcpPacket::new(&mut packet_buffer).unwrap();
+                pnet_packet::tcp::MutableTcpPacket::new(send_packet_buffer.make_contiguous())
+                    .unwrap();
+
             syn_ack_packet.set_source(connection.source_port);
             syn_ack_packet.set_destination(sender_port);
             syn_ack_packet.set_acknowledgement(sender_seq_number + 1);
@@ -181,11 +193,13 @@ where
                 .connect(connection.source_address, sender_address, P::get_config())
                 .await;
 
-            P::send(&ip_connection, syn_ack_packet.packet()).await;
-            packet_buffer.clear();
-            P::receive(&mut ip_connection, &mut packet_buffer).await;
+            P::send(&ip_connection, &mut send_packet_buffer).await;
 
-            let ack_packet = pnet_packet::tcp::TcpPacket::new(&packet_buffer).unwrap();
+            send_packet_buffer.clear();
+            recv_packet_buffer.clear();
+            P::receive(&mut ip_connection, &mut recv_packet_buffer).await;
+
+            let ack_packet = pnet_packet::tcp::TcpPacket::new(&recv_packet_buffer).unwrap();
 
             let destination_port = ack_packet.get_destination();
             let ack_number = ack_packet.get_acknowledgement();
@@ -249,16 +263,31 @@ impl<P: Listener + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address +
         }
     }
 
+    // MOD THIS
+    // Looks like things are being added onto the buffer and it is just being extended, hmm,
+    // clear buffer each time?
     async fn next(connection: &mut Self::ListenConnection, buffer: &mut Vec<u8>) -> Self::Address {
         loop {
-            let mut underlying_data = Vec::new();
-            P::next(&mut connection.inner_connection, &mut underlying_data).await;
-            let packet = pnet_packet::ipv4::Ipv4Packet::new(&underlying_data).unwrap();
+            P::next(&mut connection.inner_connection, buffer).await;
+
+            for i in 0..8 {
+                buffer.remove(0);
+            }
+            let packet = pnet_packet::ipv4::Ipv4Packet::new(buffer).unwrap();
+
             if packet.get_destination() == connection.source_address
                 && connection.config.protocol == packet.get_next_level_protocol()
             {
-                buffer.extend_from_slice(packet.payload());
-                return packet.get_source();
+                let header_length = 20;
+
+                let payload_length = packet.payload().len();
+                let total_size = header_length + payload_length;
+                let address = packet.get_source();
+
+                buffer.copy_within(header_length..total_size, 0);
+                buffer.truncate(payload_length);
+
+                return address;
             }
         }
     }
@@ -289,14 +318,18 @@ impl Listener for Ether {
 
     async fn next(connection: &mut Self::ListenConnection, buffer: &mut Vec<u8>) -> Self::Address {
         loop {
-            let data = connection.receiver.recv().await.unwrap();
-            let packet = pnet_packet::ethernet::EthernetPacket::new(&data).unwrap();
+            let mut data = connection.receiver.recv().await.unwrap();
+
+            let packet =
+                pnet_packet::ethernet::EthernetPacket::new(data.make_contiguous()).unwrap();
             let packet_source = packet.get_source();
             let packet_destination = packet.get_destination();
+
             if packet_destination == connection.source_address
                 && packet.get_ethertype() == connection.config.ether_type
             {
                 buffer.extend_from_slice(packet.payload());
+
                 return packet_source;
             }
         }
@@ -306,7 +339,7 @@ impl Listener for Ether {
 pub struct EtherListenConnection {
     source_address: MacAddr,
     config: EtherConnectionConfig,
-    receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
+    receiver: tokio::sync::broadcast::Receiver<VecDeque<u8>>,
 }
 
 // PROTOCOL TRAIT SECTION
@@ -328,7 +361,7 @@ pub trait Protocol: Send + Sync {
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>);
     async fn send(connection: &Self::Connection, data: &mut VecDeque<u8>);
     async fn send_slice(connection: &Self::Connection, data: &[u8]) {
-        Self::send(connection, &mut data.to_vec().into());
+        Self::send(connection, &mut data.to_vec().into()).await;
     }
 }
 
@@ -365,20 +398,26 @@ where
         }
     }
 
+    // The sender and reciever both say vecdeq, now i suppose the next question is
+    // can one be different, i assume not, but that might create other issues.
+
+    // MOD this one
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
         if let Some(cached_payload) = connection.cached_payload.take() {
             buffer.extend(cached_payload);
             return;
         }
         loop {
-            let mut underlying_buffer = Vec::new();
-            P::receive(&mut connection.connection, &mut underlying_buffer).await;
-            let packet = pnet_packet::udp::UdpPacket::new(&underlying_buffer).unwrap();
-            println!("{:?}", packet);
+            P::receive(&mut connection.connection, buffer).await;
+            let packet = pnet_packet::udp::UdpPacket::new(buffer).unwrap();
             if packet.get_source() == connection.destination_port
                 && packet.get_destination() == connection.source_port
             {
-                buffer.append(&mut packet.payload().to_vec());
+                let header_length = 8;
+                let payload_length = packet.payload().len();
+                let total_size = header_length + payload_length;
+                buffer.copy_within(header_length..total_size, 0);
+                buffer.truncate(payload_length);
                 return;
             }
         }
@@ -468,10 +507,12 @@ where
         syn_packet.set_destination(destination_port);
         syn_packet.set_flags(2);
         syn_packet.set_sequence(0);
-        println!("{:#?}", syn_packet);
+
         P::send_slice(&ip_connection, syn_packet.packet()).await;
+
         packet_buffer.clear();
         P::receive(&mut ip_connection, &mut packet_buffer).await;
+
         let syn_ack_packet = pnet_packet::tcp::TcpPacket::new(&packet_buffer).unwrap();
         let flags = syn_ack_packet.get_flags();
         let is_ack = flags & 0b10 != 0;
@@ -501,7 +542,7 @@ where
         todo!()
     }
 
-    async fn send(connection: &Self::Connection, data: &[u8]) {
+    async fn send(connection: &Self::Connection, data: &mut VecDeque<u8>) {
         todo!()
     }
 }
@@ -576,12 +617,14 @@ impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address +
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
         loop {
             P::receive(&mut connection.connection, buffer).await;
+
             let packet = pnet_packet::ipv4::Ipv4Packet::new(buffer).unwrap();
+
             if packet.get_source() == connection.destination_ip
                 && packet.get_destination() == connection.source_ip
                 && connection.config.protocol == packet.get_next_level_protocol()
             {
-                let header_length = packet.get_header_length() as usize;
+                let header_length = 20;
                 let payload_length = packet.payload().len();
                 let total_size = header_length + payload_length;
                 buffer.copy_within(header_length..total_size, 0);
@@ -591,21 +634,23 @@ impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address +
         }
     }
 
-    async fn send(connection: &Self::Connection, data: &[u8]) {
-        let packet_buffer = vec![0; 20 + data.len()];
-        let packet_total_len = packet_buffer.len();
-        let mut packet = pnet_packet::ipv4::MutableIpv4Packet::owned(packet_buffer).unwrap();
+    async fn send(connection: &Self::Connection, data: &mut VecDeque<u8>) {
+        for i in 0..20 {
+            data.push_front(0);
+        }
+
+        let packet_total_len = data.len();
+        let mut packet = pnet_packet::ipv4::MutableIpv4Packet::new(data.make_contiguous()).unwrap();
         packet.set_version(4);
         packet.set_header_length(5);
         packet.set_total_length(packet_total_len as u16);
         packet.set_next_level_protocol(connection.config.protocol);
         packet.set_source(connection.source_ip);
         packet.set_destination(connection.destination_ip);
-        packet.set_payload(data);
         let checksum = pnet_packet::ipv4::checksum(&packet.to_immutable());
         packet.set_checksum(checksum);
-        let packet_vec = packet.packet().to_vec();
-        P::send(&connection.connection, &packet_vec).await;
+
+        P::send(&connection.connection, data).await;
     }
 }
 
@@ -657,8 +702,9 @@ impl Protocol for Ether {
 
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
         loop {
-            let data = connection.receiver.recv().await.unwrap();
-            let packet = pnet_packet::ethernet::EthernetPacket::new(&data).unwrap();
+            let mut data = connection.receiver.recv().await.unwrap();
+            let packet =
+                pnet_packet::ethernet::EthernetPacket::new(data.make_contiguous()).unwrap();
             let packet_source = packet.get_source();
             let packet_destination = packet.get_destination();
             if packet_source == connection.destination_mac
@@ -666,20 +712,29 @@ impl Protocol for Ether {
                 && packet.get_ethertype() == connection.config.ether_type
             {
                 buffer.extend_from_slice(packet.payload());
+
+                for i in 0..8 {
+                    buffer.remove(0);
+                }
                 return;
             }
         }
     }
 
-    async fn send(connection: &Self::Connection, data: &[u8]) {
-        let mut packet_buffer = vec![0; 22 + data.len()];
+    async fn send(connection: &Self::Connection, data: &mut VecDeque<u8>) {
+        for i in 0..22 {
+            data.push_front(0);
+        }
+
         let mut packet =
-            pnet_packet::ethernet::MutableEthernetPacket::new(&mut packet_buffer).unwrap();
+            pnet_packet::ethernet::MutableEthernetPacket::new(data.make_contiguous()).unwrap();
         packet.set_source(connection.source_mac);
         packet.set_destination(connection.destination_mac);
         packet.set_ethertype(connection.config.ether_type);
-        packet.set_payload(data);
-        connection.sender.send(packet_buffer).unwrap();
+
+        // FOr some reason 8 bits are added onto the front that are extra...
+        connection.sender.send(data.clone()).unwrap(); // <---- By cloning aren't we getting rid
+                                                       // of the benefits of not having multiple buffers?
     }
 }
 
@@ -701,13 +756,13 @@ pub struct EtherConnection {
     source_mac: MacAddr,
     destination_mac: MacAddr,
     config: EtherConnectionConfig,
-    sender: tokio::sync::broadcast::Sender<Vec<u8>>,
-    receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
+    sender: tokio::sync::broadcast::Sender<VecDeque<u8>>,
+    receiver: tokio::sync::broadcast::Receiver<VecDeque<u8>>,
 }
 
 pub struct Ether {
-    sender: tokio::sync::broadcast::Sender<Vec<u8>>,
-    receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
+    sender: tokio::sync::broadcast::Sender<VecDeque<u8>>,
+    receiver: tokio::sync::broadcast::Receiver<VecDeque<u8>>,
 }
 
 impl<

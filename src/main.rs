@@ -27,7 +27,7 @@ async fn main() {
         },
     };
 
-    let udp_1 = UDP {
+    let tcp_1 = TCP {
         inner_protocol: ip_1,
     };
 
@@ -45,27 +45,27 @@ async fn main() {
         },
     };
 
-    let udp_2 = UDP {
+    let tcp_2 = TCP {
         inner_protocol: ip_2,
     };
-    let mut server_connection = udp_2.bind((Ipv4Addr::new(190, 16, 16, 16), 80));
+    let mut server_connection = tcp_2.bind((Ipv4Addr::new(190, 16, 16, 16), 80));
 
-    let connection_1 = udp_1
-        .connect(
-            (Ipv4Addr::new(192, 16, 16, 16), 80),
-            (Ipv4Addr::new(190, 16, 16, 16), 80),
-            (),
-        )
-        .await;
-    let mut data = VecDeque::new();
-    data.push_front(4);
-    data.push_front(2);
-    data.push_front(1);
-    UDP::send(&connection_1, &mut data).await;
-    let mut connection_2 = udp_2.next(&mut server_connection).await;
+    let connection_1_future = tcp_1.connect(
+        (Ipv4Addr::new(192, 16, 16, 16), 80),
+        (Ipv4Addr::new(190, 16, 16, 16), 80),
+        (),
+    );
+    let connection_2_future = tcp_2.next(&mut server_connection);
 
+    let (connection_1, mut connection_2) = tokio::join!(connection_1_future, connection_2_future);
+
+    println!("MADE CONNECTION");
+    let data = vec![1, 2, 4];
+
+    TCP::send_slice(&connection_1, &data[..]).await;
     let mut buffer = Vec::new();
-    UDP::receive(&mut connection_2, &mut buffer).await;
+    TCP::receive(&mut connection_2, &mut buffer).await;
+
     println!("{:?}", buffer);
 }
 
@@ -215,8 +215,8 @@ where
                 destination_port: sender_port,
                 destination_address: sender_address,
                 source_address: connection.source_address,
-                seq_num: 0,
-                ack_num: 0,
+                seq_num: 1,
+                ack_num: 1,
             };
         }
     }
@@ -537,8 +537,8 @@ where
             destination_port,
             destination_address,
             source_address,
-            seq_num: 0,
-            ack_num: 0,
+            seq_num: 1,
+            ack_num: server_seq + 1,
         }
     }
 
@@ -550,7 +550,9 @@ where
             let packet = pnet_packet::tcp::TcpPacket::new(buffer).unwrap();
             if packet.get_source() == connection.destination_port
                 && packet.get_destination() == connection.source_port
+                && connection.ack_num + packet.payload().len() as u32 == packet.get_sequence()
             {
+                connection.ack_num = packet.get_sequence();
                 let header_length = 20;
                 let payload_length = packet.payload().len();
                 let total_size = header_length + payload_length;
@@ -562,14 +564,15 @@ where
     }
 
     async fn send(connection: &Self::Connection, data: &mut VecDeque<u8>) {
+        let data_total_len = data.len() as u32;
         data.reserve(20);
         for i in 0..20 {
             data.push_front(0);
         }
-        let packet_total_len = data.len();
         let mut packet = pnet_packet::tcp::MutableTcpPacket::new(data.make_contiguous()).unwrap();
         packet.set_source(connection.source_port);
         packet.set_destination(connection.destination_port);
+        packet.set_sequence(connection.seq_num + data_total_len);
         let checksum = Self::calculate_checksum(
             packet.to_immutable(),
             connection.source_address,

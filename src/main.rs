@@ -215,6 +215,8 @@ where
                 destination_port: sender_port,
                 destination_address: sender_address,
                 source_address: connection.source_address,
+                seq_num: 0,
+                ack_num: 0,
             };
         }
     }
@@ -535,6 +537,8 @@ where
             destination_port,
             destination_address,
             source_address,
+            seq_num: 0,
+            ack_num: 0,
         }
     }
 
@@ -605,6 +609,8 @@ pub struct TCPConnection<P: Protocol> {
     destination_port: u16,
     destination_address: P::Address,
     source_address: P::Address,
+    seq_num: u32,
+    ack_num: u32,
 }
 
 pub struct TCP<P> {

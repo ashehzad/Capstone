@@ -4,7 +4,7 @@ use pnet_packet::Packet;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::net::Ipv4Addr;
-use std::panic::panic_any;
+use std::time::Duration;
 use tokio::sync::broadcast;
 
 // The main function is used to test the overall program. It is used to create the different
@@ -57,15 +57,17 @@ async fn main() {
     );
     let connection_2_future = tcp_2.next(&mut server_connection);
 
-    let (connection_1, mut connection_2) = tokio::join!(connection_1_future, connection_2_future);
+    let (mut connection_1, mut connection_2) =
+        tokio::join!(connection_1_future, connection_2_future);
 
     println!("MADE CONNECTION");
     let data = vec![1, 2, 4];
-
-    TCP::send_slice(&connection_1, &data[..]).await;
     let mut buffer = Vec::new();
-    TCP::receive(&mut connection_2, &mut buffer).await;
 
+    let send_future = TCP::send_slice(&mut connection_1, &data[..]);
+    let recv_future = TCP::receive(&mut connection_2, &mut buffer);
+
+    tokio::join!(send_future, recv_future);
     println!("{:?}", buffer);
 }
 
@@ -153,10 +155,6 @@ where
     }
 
     async fn next(&self, connection: &mut Self::ServerConnection) -> Self::Connection {
-        // Issue is now around the different types of buffers being used
-        // Next for listener expects a Vec, and so does recieve
-        // However, send now expects a Vecdeq. Because they are all used in the TCP
-        // next, either I have two seperate buffers, or revert back...
         let mut send_packet_buffer: VecDeque<u8> = VecDeque::new();
         let mut recv_packet_buffer = Vec::new();
         loop {
@@ -170,7 +168,6 @@ where
             let destination_port = syn_packet.get_destination();
             let sender_seq_number = syn_packet.get_sequence();
             let sender_port = syn_packet.get_source();
-            // so again the buffer is messed up and we enter the if statement
 
             if !is_syn || destination_port != connection.source_port {
                 continue;
@@ -193,9 +190,8 @@ where
                 .connect(connection.source_address, sender_address, P::get_config())
                 .await;
 
-            P::send(&ip_connection, &mut send_packet_buffer).await;
+            P::send(&mut ip_connection, &mut send_packet_buffer).await;
 
-            send_packet_buffer.clear();
             recv_packet_buffer.clear();
             P::receive(&mut ip_connection, &mut recv_packet_buffer).await;
 
@@ -216,7 +212,7 @@ where
                 destination_address: sender_address,
                 source_address: connection.source_address,
                 seq_num: 1,
-                ack_num: 1,
+                ack_num: sender_seq_number + 1,
             };
         }
     }
@@ -272,9 +268,6 @@ impl<P: Listener + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address +
         loop {
             P::next(&mut connection.inner_connection, buffer).await;
 
-            for i in 0..8 {
-                buffer.remove(0);
-            }
             let packet = pnet_packet::ipv4::Ipv4Packet::new(buffer).unwrap();
 
             if packet.get_destination() == connection.source_address
@@ -361,8 +354,8 @@ pub trait Protocol: Send + Sync {
         connection_config: Self::ConnectionConfig,
     ) -> Self::Connection;
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>);
-    async fn send(connection: &Self::Connection, data: &mut VecDeque<u8>);
-    async fn send_slice(connection: &Self::Connection, data: &[u8]) {
+    async fn send(connection: &mut Self::Connection, data: &mut VecDeque<u8>);
+    async fn send_slice(connection: &mut Self::Connection, data: &[u8]) {
         Self::send(connection, &mut data.to_vec().into()).await;
     }
 }
@@ -425,7 +418,7 @@ where
         }
     }
 
-    async fn send(connection: &Self::Connection, data: &mut VecDeque<u8>) {
+    async fn send(connection: &mut Self::Connection, data: &mut VecDeque<u8>) {
         data.reserve(8);
         for i in 0..8 {
             data.push_front(0);
@@ -441,7 +434,7 @@ where
             connection.destination_address,
         );
         packet.set_checksum(checksum);
-        P::send(&connection.connection, data).await;
+        P::send(&mut connection.connection, data).await;
     }
 }
 
@@ -510,15 +503,15 @@ where
         syn_packet.set_flags(2);
         syn_packet.set_sequence(0);
 
-        P::send_slice(&ip_connection, syn_packet.packet()).await;
+        P::send_slice(&mut ip_connection, syn_packet.packet()).await;
 
         packet_buffer.clear();
         P::receive(&mut ip_connection, &mut packet_buffer).await;
 
         let syn_ack_packet = pnet_packet::tcp::TcpPacket::new(&packet_buffer).unwrap();
         let flags = syn_ack_packet.get_flags();
-        let is_ack = flags & 0b10 != 0;
-        let is_syn = flags & 0b10000 != 0;
+        let is_ack = flags & 0b10000 != 0;
+        let is_syn = flags & 0b10 != 0;
         let server_seq = syn_ack_packet.get_sequence();
 
         if !is_ack || !is_syn {
@@ -530,7 +523,7 @@ where
         ack_packet.set_destination(destination_port);
         ack_packet.set_flags(1 << 4);
         ack_packet.set_acknowledgement(server_seq + 1);
-        P::send_slice(&ip_connection, ack_packet.packet()).await;
+        P::send_slice(&mut ip_connection, ack_packet.packet()).await;
         TCPConnection {
             connection: ip_connection,
             source_port,
@@ -542,20 +535,25 @@ where
         }
     }
 
-    // add ack and seq numb to the tcp connection struct
-
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
         loop {
             P::receive(&mut connection.connection, buffer).await;
             let packet = pnet_packet::tcp::TcpPacket::new(buffer).unwrap();
             if packet.get_source() == connection.destination_port
                 && packet.get_destination() == connection.source_port
-                && connection.ack_num + packet.payload().len() as u32 == packet.get_sequence()
+                && connection.ack_num == packet.get_sequence()
             {
-                connection.ack_num = packet.get_sequence();
                 let header_length = 20;
                 let payload_length = packet.payload().len();
                 let total_size = header_length + payload_length;
+                connection.ack_num = connection.ack_num.wrapping_add(payload_length as u32);
+                let ack_buffer = vec![0; 20];
+                let mut ack_packet = pnet_packet::tcp::MutableTcpPacket::owned(ack_buffer).unwrap();
+                ack_packet.set_source(connection.source_port);
+                ack_packet.set_destination(connection.destination_port);
+                ack_packet.set_acknowledgement(connection.ack_num);
+                ack_packet.set_flags(1 << 4);
+                P::send_slice(&mut connection.connection, ack_packet.packet()).await;
                 buffer.copy_within(header_length..total_size, 0);
                 buffer.truncate(payload_length);
                 return;
@@ -563,23 +561,39 @@ where
         }
     }
 
-    async fn send(connection: &Self::Connection, data: &mut VecDeque<u8>) {
+    async fn send(connection: &mut Self::Connection, data: &mut VecDeque<u8>) {
         let data_total_len = data.len() as u32;
-        data.reserve(20);
+        data.reserve(20); // add back reserve to before push
         for i in 0..20 {
             data.push_front(0);
         }
         let mut packet = pnet_packet::tcp::MutableTcpPacket::new(data.make_contiguous()).unwrap();
         packet.set_source(connection.source_port);
         packet.set_destination(connection.destination_port);
-        packet.set_sequence(connection.seq_num + data_total_len);
+        packet.set_sequence(connection.seq_num);
+        connection.seq_num = connection.seq_num.wrapping_add(data_total_len);
         let checksum = Self::calculate_checksum(
             packet.to_immutable(),
             connection.source_address,
             connection.destination_address,
         );
         packet.set_checksum(checksum);
-        P::send(&connection.connection, data).await;
+        P::send(&mut connection.connection, data).await;
+        let mut ack_buffer = Vec::new();
+        if let Err(_) = tokio::time::timeout(
+            Duration::from_secs(1),
+            P::receive(&mut connection.connection, &mut ack_buffer),
+        )
+        .await
+        {
+            panic!()
+        }
+        let ack_packet = pnet_packet::tcp::TcpPacket::new(&ack_buffer).unwrap();
+        let flags = ack_packet.get_flags();
+        let is_ack = flags & 0b10000 != 0;
+        if !is_ack {
+            panic!()
+        }
     }
 }
 
@@ -614,6 +628,8 @@ pub struct TCPConnection<P: Protocol> {
     source_address: P::Address,
     seq_num: u32,
     ack_num: u32,
+    //dest_window_size: u32,
+    //window: Vec<u8>,
 }
 
 pub struct TCP<P> {
@@ -670,7 +686,7 @@ impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address +
         }
     }
 
-    async fn send(connection: &Self::Connection, data: &mut VecDeque<u8>) {
+    async fn send(connection: &mut Self::Connection, data: &mut VecDeque<u8>) {
         for i in 0..20 {
             data.push_front(0);
         }
@@ -686,7 +702,7 @@ impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address +
         let checksum = pnet_packet::ipv4::checksum(&packet.to_immutable());
         packet.set_checksum(checksum);
 
-        P::send(&connection.connection, data).await;
+        P::send(&mut connection.connection, data).await;
     }
 }
 
@@ -748,17 +764,13 @@ impl Protocol for Ether {
                 && packet.get_ethertype() == connection.config.ether_type
             {
                 buffer.extend_from_slice(packet.payload());
-
-                for i in 0..8 {
-                    buffer.remove(0);
-                }
                 return;
             }
         }
     }
 
-    async fn send(connection: &Self::Connection, data: &mut VecDeque<u8>) {
-        for i in 0..22 {
+    async fn send(connection: &mut Self::Connection, data: &mut VecDeque<u8>) {
+        for i in 0..14 {
             data.push_front(0);
         }
 
@@ -768,9 +780,8 @@ impl Protocol for Ether {
         packet.set_destination(connection.destination_mac);
         packet.set_ethertype(connection.config.ether_type);
 
-        // FOr some reason 8 bits are added onto the front that are extra...
-        connection.sender.send(data.clone()).unwrap(); // <---- By cloning aren't we getting rid
-                                                       // of the benefits of not having multiple buffers?
+        connection.sender.send(data.clone()).unwrap();
+        data.clear();
     }
 }
 

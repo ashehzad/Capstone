@@ -13,6 +13,7 @@ use tokio::sync::broadcast;
 async fn main() {
     let (tx, rx1) = broadcast::channel(16);
 
+     
     let ether_1 = Ether {
         sender: tx.clone(),
         receiver: rx1,
@@ -682,6 +683,7 @@ impl<P: Protocol + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address +
     }
 
     async fn send(connection: &mut Self::Connection, data: &mut VecDeque<u8>) {
+        data.reserve(20);
         for i in 0..20 {
             data.push_front(0);
         }

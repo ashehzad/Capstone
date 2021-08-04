@@ -82,13 +82,8 @@ async fn main() {
 // communicate with the other address.
 #[async_trait]
 pub trait Bind: Protocol {
-    // A server connection is created and bound to a address and used to listen for new connections
     type ServerConnection: Send + Sync;
-    // bind is used to bind to a specific address and give back a server connection,which is then
-    // used to get new connections
     fn bind(&self, address: Self::Address) -> Self::ServerConnection;
-    // Next is used to listen on the server connection and when new connections are found, this
-    // function returns them to be used.
     async fn next(&self, connection: &mut Self::ServerConnection) -> Self::Connection;
 }
 

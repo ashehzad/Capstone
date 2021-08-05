@@ -440,10 +440,13 @@ where
     }
 
     async fn send(connection: &mut Self::Connection, data: &mut VecDeque<u8>) {
+        // Reserve data to prevent constant reallocation
         data.reserve(8);
         for i in 0..8 {
             data.push_front(0);
         }
+        
+        // Push packed onto buffer and send to lower level
         let packet_total_len = data.len();
         let mut packet = pnet_packet::udp::MutableUdpPacket::new(data.make_contiguous()).unwrap();
         packet.set_source(connection.source_port);
@@ -459,6 +462,7 @@ where
     }
 }
 
+// Checksum trait for UDP, used to call the method from Pnet in the Impl
 pub trait UDPChecksum<P: Protocol> {
     fn calculate_checksum(
         packet: pnet_packet::udp::UdpPacket,
@@ -482,6 +486,8 @@ impl<
     }
 }
 
+// Struct for the connection. Also stores a cached_payload because
+// UDP's first packet also has information that is needed.
 pub struct UDPConnection<P: Protocol> {
     cached_payload: Option<Vec<u8>>,
     connection: P::Connection,
@@ -491,6 +497,7 @@ pub struct UDPConnection<P: Protocol> {
     source_address: P::Address,
 }
 
+// Struct for UDP, stores the inner protocol
 pub struct UDP<P> {
     inner_protocol: P,
 }
@@ -507,6 +514,8 @@ where
     type Connection = TCPConnection<P>;
     type ConnectionConfig = ();
 
+    
+    // Handles 3-way handshake
     async fn connect(
         &self,
         (source_address, source_port): Self::Address,
@@ -556,6 +565,7 @@ where
         }
     }
 
+    // Handles sending back ACK as well
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
         loop {
             P::receive(&mut connection.connection, buffer).await;
@@ -582,9 +592,13 @@ where
         }
     }
 
+    //sends the data and waits for ACK back. Currently the data being sent is
+    // not really a stream, but just the entire buffer. Splitting the buffer is
+    // more of a TCP implementation then Protocol design issue. This is also
+    // true for other TCP functionality such as re-try packet send.
     async fn send(connection: &mut Self::Connection, data: &mut VecDeque<u8>) {
         let data_total_len = data.len() as u32;
-        data.reserve(20); // add back reserve to before push
+        data.reserve(20); 
         for i in 0..20 {
             data.push_front(0);
         }
@@ -618,6 +632,7 @@ where
     }
 }
 
+// Holds TCP checksum information which is used later by pnet
 pub trait TCPChecksum<P: Protocol> {
     fn calculate_checksum(
         packet: pnet_packet::tcp::TcpPacket,
@@ -641,6 +656,7 @@ impl<
     }
 }
 
+// Holds Connection information for TCP
 pub struct TCPConnection<P: Protocol> {
     connection: P::Connection,
     source_port: u16,
@@ -649,8 +665,6 @@ pub struct TCPConnection<P: Protocol> {
     source_address: P::Address,
     seq_num: u32,
     ack_num: u32,
-    //dest_window_size: u32,
-    //window: Vec<u8>,
 }
 
 pub struct TCP<P> {
@@ -741,6 +755,7 @@ pub struct IP<P, F> {
     address_translator: F,
 }
 
+// Used to hold information on what is inside the IP packet
 #[derive(Debug)]
 pub struct IPConnectionConfig {
     protocol: pnet_packet::ip::IpNextHeaderProtocol,
@@ -792,6 +807,7 @@ impl Protocol for Ether {
     }
 
     async fn send(connection: &mut Self::Connection, data: &mut VecDeque<u8>) {
+        data.reserve(14);
         for i in 0..14 {
             data.push_front(0);
         }
@@ -815,6 +831,7 @@ impl<P, F> SupportedConfiguration<IP<P, F>> for Ether {
     }
 }
 
+// Holds information like what type of ether is used for the Ether packet
 #[derive(Debug)]
 pub struct EtherConnectionConfig {
     ether_type: pnet_packet::ethernet::EtherType,

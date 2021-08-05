@@ -13,7 +13,6 @@ use tokio::sync::broadcast;
 async fn main() {
     let (tx, rx1) = broadcast::channel(16);
 
-     
     let ether_1 = Ether {
         sender: tx.clone(),
         receiver: rx1,
@@ -60,7 +59,7 @@ async fn main() {
 
     let (mut connection_1, mut connection_2) =
         tokio::join!(connection_1_future, connection_2_future);
-    
+
     let data = vec![1, 2, 4];
     let mut buffer = Vec::new();
 
@@ -77,9 +76,6 @@ async fn main() {
 // BIND TRAIT SECTION
 //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
-// This protocol is used by the server to bind to a address and then listen/wait for any
-// connections to that address. Once this is done, the server can then use that connection to
-// communicate with the other address.
 #[async_trait]
 // The Bind trait is used to bind to a address and await any new incoming connections. When a new
 // one arrives, this will complete the server side Connection and use it to communicate back.
@@ -87,11 +83,11 @@ async fn main() {
 pub trait Bind: Protocol {
     // Stores information about the server
     type ServerConnection: Send + Sync;
-    
+
     //Creates the ServerConnection by binding to the given address
     fn bind(&self, address: Self::Address) -> Self::ServerConnection;
-    
-    // Uses the ServerConenction to wait and return Connections
+
+    // Uses the ServerConnection to wait and return Connections
     async fn next(&self, connection: &mut Self::ServerConnection) -> Self::Connection;
 }
 
@@ -113,7 +109,6 @@ where
 
     async fn next(&self, connection: &mut Self::ServerConnection) -> Self::Connection {
         loop {
-          
             let mut buffer = Vec::new();
             let sender_address = P::next(&mut connection.inner_connection, &mut buffer).await;
             let packet = pnet_packet::udp::UdpPacket::new(&buffer).unwrap();
@@ -199,7 +194,7 @@ where
             P::send(&mut ip_connection, &mut send_packet_buffer).await;
 
             recv_packet_buffer.clear();
-            
+
             // Get the Ack packet and finish the Connection
             P::receive(&mut ip_connection, &mut recv_packet_buffer).await;
 
@@ -246,7 +241,7 @@ pub trait Listener: Protocol {
         address: Self::Address,
         config: Self::ConnectionConfig,
     ) -> Self::ListenConnection;
-    
+
     // Hands back the information on the client
     async fn next(connection: &mut Self::ListenConnection, buffer: &mut Vec<u8>) -> Self::Address;
 }
@@ -355,10 +350,10 @@ pub struct EtherListenConnection {
 pub trait Protocol: Send + Sync {
     // Address to send to
     type Address: Copy + Send + Sync;
-    
+
     // Struct used to hold information about source and destination
     type Connection: Send + Sync;
-    
+
     // Struct used to hold information about the Connection Configuration like IP options
     type ConnectionConfig: Send;
 
@@ -369,15 +364,15 @@ pub trait Protocol: Send + Sync {
         destination_address: Self::Address,
         connection_config: Self::ConnectionConfig,
     ) -> Self::Connection;
-    
+
     // Takes mutable Connection reference and recieves data
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>);
-    
+
     // Takes mutable Connection reference and sends data
     async fn send(connection: &mut Self::Connection, data: &mut VecDeque<u8>);
-    
+
     // Takes mutable Connection reference and sends data as a slice,
-    // Ultimetly calls the function above
+    // Ultimately calls the function above
     async fn send_slice(connection: &mut Self::Connection, data: &[u8]) {
         Self::send(connection, &mut data.to_vec().into()).await;
     }
@@ -413,15 +408,14 @@ where
     }
 
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
-        
         // As UDP's first packet is not a handshake but actual data it is
         // stored for use
         if let Some(cached_payload) = connection.cached_payload.take() {
             buffer.extend(cached_payload);
             return;
         }
-        
-        // Loop, recieve data and check if it is for here, then put it into
+
+        // Loop, receive data and check if it is for here, then put it into
         // the buffer and return
         loop {
             P::receive(&mut connection.connection, buffer).await;
@@ -445,7 +439,7 @@ where
         for i in 0..8 {
             data.push_front(0);
         }
-        
+
         // Push packed onto buffer and send to lower level
         let packet_total_len = data.len();
         let mut packet = pnet_packet::udp::MutableUdpPacket::new(data.make_contiguous()).unwrap();
@@ -514,7 +508,6 @@ where
     type Connection = TCPConnection<P>;
     type ConnectionConfig = ();
 
-    
     // Handles 3-way handshake
     async fn connect(
         &self,
@@ -598,7 +591,7 @@ where
     // true for other TCP functionality such as re-try packet send.
     async fn send(connection: &mut Self::Connection, data: &mut VecDeque<u8>) {
         let data_total_len = data.len() as u32;
-        data.reserve(20); 
+        data.reserve(20);
         for i in 0..20 {
             data.push_front(0);
         }
@@ -755,7 +748,7 @@ pub struct IP<P, F> {
     address_translator: F,
 }
 
-// Used to hold information on what is inside the IP packet
+// Used to hold information on what is inside the IP packet, so TCP or UDP
 #[derive(Debug)]
 pub struct IPConnectionConfig {
     protocol: pnet_packet::ip::IpNextHeaderProtocol,
@@ -851,6 +844,8 @@ pub struct Ether {
     receiver: tokio::sync::broadcast::Receiver<VecDeque<u8>>,
 }
 
+// The next two functions are used by IP to determine what packet is inside it on the Transport
+// layer.
 impl<
         P: Protocol + SupportedConfiguration<Self>,
         F: Fn(Ipv4Addr) -> P::Address + Send + Sync,

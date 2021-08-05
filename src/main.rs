@@ -60,8 +60,7 @@ async fn main() {
 
     let (mut connection_1, mut connection_2) =
         tokio::join!(connection_1_future, connection_2_future);
-
-    println!("MADE CONNECTION");
+    
     let data = vec![1, 2, 4];
     let mut buffer = Vec::new();
 
@@ -82,9 +81,17 @@ async fn main() {
 // connections to that address. Once this is done, the server can then use that connection to
 // communicate with the other address.
 #[async_trait]
+// The Bind trait is used to bind to a address and await any new incoming connections. When a new
+// one arrives, this will complete the server side Connection and use it to communicate back.
+
 pub trait Bind: Protocol {
+    // Stores information about the server
     type ServerConnection: Send + Sync;
+    
+    //Creates the ServerConnection by binding to the given address
     fn bind(&self, address: Self::Address) -> Self::ServerConnection;
+    
+    // Uses the ServerConenction to wait and return Connections
     async fn next(&self, connection: &mut Self::ServerConnection) -> Self::Connection;
 }
 
@@ -106,7 +113,7 @@ where
 
     async fn next(&self, connection: &mut Self::ServerConnection) -> Self::Connection {
         loop {
-            //if check set
+          
             let mut buffer = Vec::new();
             let sender_address = P::next(&mut connection.inner_connection, &mut buffer).await;
             let packet = pnet_packet::udp::UdpPacket::new(&buffer).unwrap();
@@ -135,6 +142,7 @@ pub struct UDPServerConnection<P: Listener> {
 }
 
 //*****TCP*****
+// For TCP the next method will also handle the 3 way handshake.
 #[async_trait]
 impl<P: Listener + SupportedConfiguration<Self>> Bind for TCP<P>
 where
@@ -159,6 +167,7 @@ where
             let sender_address =
                 P::next(&mut connection.inner_connection, &mut recv_packet_buffer).await;
 
+            // Packet inspection
             let syn_packet = pnet_packet::tcp::TcpPacket::new(&recv_packet_buffer).unwrap();
             let is_syn = syn_packet.get_flags() & 0b10 != 0;
             let destination_port = syn_packet.get_destination();
@@ -172,6 +181,7 @@ where
                 send_packet_buffer.push_front(0);
             }
 
+            // Make and send the Syn Ack packet
             let mut syn_ack_packet =
                 pnet_packet::tcp::MutableTcpPacket::new(send_packet_buffer.make_contiguous())
                     .unwrap();
@@ -189,6 +199,8 @@ where
             P::send(&mut ip_connection, &mut send_packet_buffer).await;
 
             recv_packet_buffer.clear();
+            
+            // Get the Ack packet and finish the Connection
             P::receive(&mut ip_connection, &mut recv_packet_buffer).await;
 
             let ack_packet = pnet_packet::tcp::TcpPacket::new(&recv_packet_buffer).unwrap();
@@ -201,6 +213,7 @@ where
                 continue;
             }
 
+            // Hand back a Connection
             return TCPConnection {
                 connection: ip_connection,
                 source_port: connection.source_port,

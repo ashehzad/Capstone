@@ -246,6 +246,8 @@ pub trait Listener: Protocol {
         address: Self::Address,
         config: Self::ConnectionConfig,
     ) -> Self::ListenConnection;
+    
+    // Hands back the information on the client
     async fn next(connection: &mut Self::ListenConnection, buffer: &mut Vec<u8>) -> Self::Address;
 }
 
@@ -270,9 +272,6 @@ impl<P: Listener + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address +
         }
     }
 
-    // MOD THIS
-    // Looks like things are being added onto the buffer and it is just being extended, hmm,
-    // clear buffer each time?
     async fn next(connection: &mut Self::ListenConnection, buffer: &mut Vec<u8>) -> Self::Address {
         loop {
             P::next(&mut connection.inner_connection, buffer).await;
@@ -297,6 +296,7 @@ impl<P: Listener + SupportedConfiguration<Self>, F: Fn(Ipv4Addr) -> P::Address +
     }
 }
 
+// Struct to hold a Listen Connection for IP
 pub struct IPListenConnection<P: Listener> {
     source_address: Ipv4Addr,
     config: IPConnectionConfig,
@@ -340,6 +340,7 @@ impl Listener for Ether {
     }
 }
 
+// Struct to hold a Listen Connection for Ether
 pub struct EtherListenConnection {
     source_address: MacAddr,
     config: EtherConnectionConfig,
@@ -352,26 +353,35 @@ pub struct EtherListenConnection {
 // to connect with a remote address, and then using that connection send and receive data.
 #[async_trait]
 pub trait Protocol: Send + Sync {
+    // Address to send to
     type Address: Copy + Send + Sync;
+    
+    // Struct used to hold information about source and destination
     type Connection: Send + Sync;
+    
+    // Struct used to hold information about the Connection Configuration like IP options
     type ConnectionConfig: Send;
 
+    // Creates and returns a Connection
     async fn connect(
         &self,
         source_address: Self::Address,
         destination_address: Self::Address,
         connection_config: Self::ConnectionConfig,
     ) -> Self::Connection;
+    
+    // Takes mutable Connection reference and recieves data
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>);
+    
+    // Takes mutable Connection reference and sends data
     async fn send(connection: &mut Self::Connection, data: &mut VecDeque<u8>);
+    
+    // Takes mutable Connection reference and sends data as a slice,
+    // Ultimetly calls the function above
     async fn send_slice(connection: &mut Self::Connection, data: &[u8]) {
         Self::send(connection, &mut data.to_vec().into()).await;
     }
 }
-
-// Currently failure is not built into the system, so like what happens if it fails to send etc
-// So, the thing with UDP is that ut us really meant to send individual packets, and not streams
-// of data, so we only need to worry about a packet at a time.
 
 //*****UDP*****
 #[async_trait]
@@ -402,15 +412,17 @@ where
         }
     }
 
-    // The sender and reciever both say vecdeq, now i suppose the next question is
-    // can one be different, i assume not, but that might create other issues.
-
-    // MOD this one
     async fn receive(connection: &mut Self::Connection, buffer: &mut Vec<u8>) {
+        
+        // As UDP's first packet is not a handshake but actual data it is
+        // stored for use
         if let Some(cached_payload) = connection.cached_payload.take() {
             buffer.extend(cached_payload);
             return;
         }
+        
+        // Loop, recieve data and check if it is for here, then put it into
+        // the buffer and return
         loop {
             P::receive(&mut connection.connection, buffer).await;
             let packet = pnet_packet::udp::UdpPacket::new(buffer).unwrap();
